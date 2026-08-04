@@ -64,7 +64,8 @@ gh_curl() {
     if curl -fL --retry 2 "$@" "$url" -o "$tmp" >/dev/null 2>&1; then
         cat "$tmp"; rm -f "$tmp"; return 0
     fi
-    info "GitHub 直连失败, 走 gh-proxy.com 镜像: ${url}"
+    # 提示走 stderr, 避免污染 stdout 数据流 (下载文件时首行会混入 [INFO])
+    info "GitHub 直连失败, 走 gh-proxy.com 镜像: ${url}" >&2
     if curl -fL --retry 2 "$@" "${GHPROXY}${url}" -o "$tmp" >/dev/null 2>&1; then
         cat "$tmp"; rm -f "$tmp"; return 0
     fi
