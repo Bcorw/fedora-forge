@@ -1,12 +1,13 @@
 #!/bin/bash
 # ============================================================================
-#  Fedora Forge — Fedora 44+ 全面初始化 & 优化脚本 v4.1
+#  Fedora Forge — Fedora 44+ 全面初始化 & 优化脚本 v4.2
 #  (dnf5 / KDE Plasma)
 #  ---------------------------------------------------------------------------
 #  模块:
 #    1. 软件源优化   — 多站并发测速 + RPM Fusion + Flathub + 开机自启
 #    2. 系统升级检查 — 内核模块完整性 + 全量升级 (首次需重启后二次运行)
-#    3. CPU/GPU驱动  — NVIDIA 官方595生产分支(open模块) / AMD
+#    3. CPU/GPU驱动  — 自动识别 NVIDIA/AMD/Intel, 安装对应驱动
+#                    — NVIDIA 固定生产版 595.80 (open 模块, 默认钉死; FF_NV_VERSION 可换)
 #                    — 电源方案选择: 系统默认(amd-pstate EPP) / auto-cpufreq
 #                    — 音视频解码
 #    4. 终端配置     — 字体 + Zsh/Starship/Zinit + Konsole/Kitty
@@ -66,7 +67,8 @@ for arg in "$@"; do
             echo ""
             echo "模块 (可组合, 无参数=执行 1-6 核心模块):"
             echo "  -source   软件源优化"
-            echo "  -gpu      CPU/GPU驱动(595生产分支) + 电源方案 + 音视频解码"
+            echo "  -gpu      CPU/GPU驱动(自动识别, NVIDIA固定595.80) + 电源方案 + 解码"
+            echo "            环境变量: FF_NV_VERSION=595.xx 换NVIDIA版本; FF_POWER=auto|default 免交互"
             echo "  -term     终端配置 (字体 + Zsh/Starship/Zinit + Konsole/Kitty)"
             echo "  -theme    主题 & 系统优化 (含 NetworkManager 优化)"
             echo "  -apps     应用管理 (卸载 + 安装)"
@@ -577,11 +579,14 @@ SRCSCRIPT
 optimize_gpu() {
     step "3/7 CPU/GPU驱动 + 电源方案 + 音视频解码"
 
-    local GPU_INFO HAS_NVIDIA=0 HAS_AMD=0
+    local GPU_INFO HAS_NVIDIA=0 HAS_AMD=0 HAS_INTEL=0
     GPU_INFO=$(lspci -nn 2>/dev/null | grep -iE "VGA|3D|Display" || true)
-    echo "$GPU_INFO" | grep -qi "NVIDIA"              && HAS_NVIDIA=1
-    echo "$GPU_INFO" | grep -qiE "AMD|Radeon|ATI"     && HAS_AMD=1
-    info "检测: NVIDIA=$HAS_NVIDIA  AMD=$HAS_AMD"
+    # 用 lspci -nn 的厂商 ID 检测 (描述文字不可靠: "Corporation" 含 "ati",
+    #  会把 Intel/NVIDIA 设备误判成 AMD)
+    echo "$GPU_INFO" | grep -qi "\[10de:"           && HAS_NVIDIA=1
+    echo "$GPU_INFO" | grep -qiE "\[1002:|\[1022:"  && HAS_AMD=1
+    echo "$GPU_INFO" | grep -qi "\[8086:"           && HAS_INTEL=1
+    info "检测: NVIDIA=$HAS_NVIDIA  AMD=$HAS_AMD  Intel=$HAS_INTEL"
 
     # 禁用系统默认电源管理服务 (幂等: 已 masked 则跳过, 避免重复 systemctl 调用)
     disable_service() {  # disable_service <服务名>
@@ -745,18 +750,18 @@ EOF
     #  610.x = 新特性分支(测试版): 有显示管线回归 (color_pipeline 色斑/内屏黑屏/atomic commit 失败)
     #  595.x = 生产稳定分支; Blackwell (RTX 50) 必须用 open 内核模块 (-M=open)
     if [[ "$HAS_NVIDIA" -eq 1 ]]; then
-        local NV_VER NV_TARGET NV_LATEST NV_URL NV_RUN NV_SHA
+        local NV_VER NV_TARGET NV_URL NV_RUN NV_SHA
         NV_VER=$(modinfo -F version nvidia 2>/dev/null || true)
 
-        # 从 NVIDIA 官方获取生产分支最新版本 (latest.txt 指向 595.x)
-        NV_LATEST=$(curl -fs --max-time 30 "https://download.nvidia.com/XFree86/Linux-x86_64/latest.txt" 2>/dev/null | head -1 || true)
-        NV_TARGET=$(echo "$NV_LATEST" | awk '{print $1}')
-        NV_URL=$(echo "$NV_LATEST" | awk '{print $2}')
-        if [[ -z "$NV_TARGET" ]]; then
-            warn "无法获取 NVIDIA 官方最新版, 回退到已知稳定版 595.80"
-            NV_TARGET="595.80"
-            NV_URL="595.80/NVIDIA-Linux-x86_64-595.80.run"
+        # ── 固定使用已验证的稳定版 ──
+        #  610 新特性分支 bug 太多 (色斑/内屏黑屏/atomic commit 失败/Chrome 崩溃)
+        #  595 生产分支稳定; 但后续小版本也可能引入回归 (如 595.84 DP 问题),
+        #  故默认钉死实测稳定的 595.80. 换版本: FF_NV_VERSION=595.xx sudo bash $0 -gpu
+        NV_TARGET="${FF_NV_VERSION:-595.80}"
+        if [[ "$NV_TARGET" == 610.* ]]; then
+            warn "⚠ FF_NV_VERSION=610.x 为新特性分支(测试版), 已知 bug: 色斑/内屏黑屏/atomic commit 失败!"
         fi
+        NV_URL="${NV_TARGET}/NVIDIA-Linux-x86_64-${NV_TARGET}.run"
         NV_RUN="/opt/nvidia/NVIDIA-Linux-x86_64-${NV_TARGET}.run"
 
         if [[ -n "$NV_VER" && "$NV_VER" == "$NV_TARGET" ]]; then
@@ -845,14 +850,33 @@ EOF
         fi
     fi
 
-    # 清理本机无用的 GPU 专属包 (AMD 机上的 Intel/NVIDIA 驱动为孤包, 白白占用空间)
+    # ── Intel 核显 ──
+    if [[ "$HAS_INTEL" -eq 1 ]]; then
+        if modinfo -F name i915 >/dev/null 2>&1; then
+            info "✅ Intel 核显驱动已就绪: i915 (跳过安装)"
+        else
+            info "安装 Intel 核显驱动 (Mesa + Vulkan)..."
+            dnf_install_quiet mesa-dri-drivers mesa-vulkan-drivers \
+                mesa-vulkan-drivers.i686 || true
+        fi
+        # VA-API 硬解 (Intel QSV)
+        dnf_install_quiet intel-media-driver || true
+    fi
+
+    # 清理本机用不到的 GPU 专属包 (按检测到的硬件精确清理, 避免误删)
     if [[ "$HAS_NVIDIA" -eq 0 ]]; then
-        for pkg in libva-intel-media-driver nvidia-gpu-firmware xorg-x11-drv-nvidia-libs; do
+        for pkg in nvidia-gpu-firmware xorg-x11-drv-nvidia-libs; do
             if rpm -q "$pkg" >/dev/null 2>&1; then
                 info "清理无用包: $pkg (非本机 GPU 所需)..."
-                "$DNF" remove -y "$pkg" 2>/dev/null || true
+                "$DNF" remove -y "$pkg" >/dev/null 2>&1 || true
             fi
         done
+    fi
+    if [[ "$HAS_INTEL" -eq 0 ]]; then
+        if rpm -q libva-intel-media-driver >/dev/null 2>&1; then
+            info "清理无用包: libva-intel-media-driver (无 Intel 核显)..."
+            "$DNF" remove -y libva-intel-media-driver >/dev/null 2>&1 || true
+        fi
     fi
 
     # 幂等: dracut 仅当配置变更时重建 (90-gpu.conf 时间戳晚于 initramfs 才触发)
@@ -2039,7 +2063,7 @@ setup_steam() {
 main() {
     echo -e "${BOLD}"
     echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║       Fedora Forge 全面初始化脚本 v4.1       ║"
+    echo "  ║       Fedora Forge 全面初始化脚本 v4.2       ║"
     echo "  ║            KDE Plasma Edition               ║"
     echo "  ╚══════════════════════════════════════════════╝"
     echo -e "${NC}"
