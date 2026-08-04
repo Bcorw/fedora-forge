@@ -40,6 +40,15 @@ warn()  { echo -e "${YELLOW}[注意]${NC}  $*"; }
 error() { echo -e "${RED}[错误]${NC} $*"; }
 die()   { error "$1"; exit 1; }
 
+# 创建用户目录并确保属主为执行用户
+#  (sudo 下 mkdir -p 创建的目录属主是 root, 用户身份 (su/git/curl) 无法写入,
+#   曾导致 rime 克隆 Permission denied 和 starship 装不上)
+ensure_user_dir() {
+    local d="$1"
+    mkdir -p "$d" 2>/dev/null || true
+    chown "$ACTUAL_USER:" "$d" 2>/dev/null || true
+}
+
 # ────────────────────────────────────────────── GitHub 加速通道 (gh-proxy.com)
 # 国内网络直连 GitHub 不稳定 (clone/API/下载均可能失败):
 # 所有 GitHub 操作先直连, 失败后自动走 https://gh-proxy.com/ 镜像重试
@@ -1085,7 +1094,7 @@ setup_terminal() {
     # starship: Fedora 仓库没有, 用官方二进制 (GitHub 直连, 超时保护)
     if [[ ! -x "${ACTUAL_HOME}/.local/bin/starship" ]]; then
         info "安装 starship 提示符..."
-        mkdir -p "${ACTUAL_HOME}/.local/bin"
+        ensure_user_dir "${ACTUAL_HOME}/.local/bin"
         timeout 300 su - "$ACTUAL_USER" -c "curl -fsSL https://starship.rs/install.sh | sh -s -- -y" >/dev/null 2>&1 || \
         timeout 240 gh_curl "https://github.com/starship/starship/releases/latest/download/starship-x86_64-unknown-linux-gnu.tar.gz" > /tmp/starship.tar.gz \
             && tar -xzf /tmp/starship.tar.gz -C "${ACTUAL_HOME}/.local/bin" starship \
@@ -1241,15 +1250,20 @@ ZSHRC
         fi
         dnf_install_quiet yazi || warn "Yazi 安装失败"
     fi
-    # 图片/视频预览依赖 (仓库无此包时 dnf_ensure 自动跳过, 不中断)
-    dnf_ensure ueberzugpp || true
+    # 图片/视频预览依赖 (Fedora 官方仓库无此包, 从开发者 COPR 安装; 失败不影响其他功能)
+    if ! rpm -q ueberzugpp >/dev/null 2>&1; then
+        if dnf copr enable -y jstkdng/ueberzugpp >/dev/null 2>&1; then
+            dnf_ensure ueberzugpp || info "ueberzugpp 安装失败 (COPR 可达但包不可用), Yazi 图片预览不可用"
+        else
+            info "ueberzugpp 未安装 (COPR 不可达, Yazi 图片预览不可用, 不影响其他功能)"
+        fi
+    fi
     # 初始化 Yazi 配置目录 (首次启动由 yazi 自行生成默认配置)
-    mkdir -p "$ACTUAL_HOME/.config/yazi"
-    chown -R "$ACTUAL_USER:" "$ACTUAL_HOME/.config/yazi" 2>/dev/null || true
+    ensure_user_dir "$ACTUAL_HOME/.config/yazi"
 
     # starship 配置 (优先使用项目 konsole/starship.toml, 缺失时退回内嵌兜底)
     # 幂等: 已存在则跳过 (内容变更需手动更新)
-    mkdir -p "$ACTUAL_HOME/.config"
+    ensure_user_dir "$ACTUAL_HOME/.config"
     if [[ -f "$ACTUAL_HOME/.config/starship.toml" ]]; then
         info "✅ starship.toml 已配置 (跳过)"
     else
@@ -1898,7 +1912,7 @@ FC
         info "测试模式: 跳过雾凇安装 (需真实网络)"
     else
         info "安装 Rime 雾凇方案 (rime-ice)..."
-        mkdir -p "$(dirname "$RIME_DIR")"
+        ensure_user_dir "$(dirname "$RIME_DIR")"
         # 备份仅在循环外移动一次, 循环内绝不删除备份 (曾因 rm -rf 备份导致
         # 克隆失败时把用户已有雾凇目录也抹掉)
         local RIME_BAK="${RIME_DIR}.bak.$$"
