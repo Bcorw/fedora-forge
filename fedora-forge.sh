@@ -1080,6 +1080,28 @@ STARSHIP
     chown "$ACTUAL_USER:" "$ACTUAL_HOME/.config/starship.toml" 2>/dev/null || true
     fi
 
+    # ── Fastfetch 配置 (优先使用项目 fastfetch/ 目录部署) ──
+    # ⚠ fastfetch ≥2.16 只自动加载 config.jsonc, config.json 会被静默忽略
+    #   (实测: 直接放 config.json 终端里 fastfetch 仍显示默认 logo)
+    local FF_DIR="$ACTUAL_HOME/.config/fastfetch"
+    local FF_SRC="${RES_DIR}/fastfetch"
+    if [[ -d "$FF_SRC" && -f "$FF_SRC/config.jsonc" ]]; then
+        mkdir -p "$FF_DIR"
+        cp -f "$FF_SRC/config.jsonc" "$FF_DIR/config.jsonc"
+        if [[ -d "$FF_SRC/png" ]]; then
+            rm -rf "$FF_DIR/png"
+            cp -rf "$FF_SRC/png" "$FF_DIR/png"
+        fi
+        chown -R "$ACTUAL_USER:" "$FF_DIR" 2>/dev/null || true
+        info "✅ fastfetch 配置已从项目 fastfetch/ 部署 (config.jsonc + png)"
+    elif [[ -f "$FF_DIR/config.json" && ! -f "$FF_DIR/config.jsonc" ]]; then
+        # 旧命名兼容: config.json → config.jsonc (否则新版 fastfetch 不加载)
+        mv -f "$FF_DIR/config.json" "$FF_DIR/config.jsonc" 2>/dev/null || true
+        info "✅ fastfetch config.json 已重命名为 config.jsonc (否则不生效)"
+    else
+        info "fastfetch: 使用默认配置"
+    fi
+
     # ── 3) Konsole: 从项目 konsole/ 部署用户完善的方案 ──
     # 包含 Shell.profile (自动复制选中/中键粘贴/字体等) + Catppuccin-Frappe 配色
     # 幂等: 用户目录已有则跳过 (尊重用户手动微调)
@@ -1415,20 +1437,15 @@ LOGIN
         info "  - wait-online 服务: 已禁用并 mask"
     fi
 
-    mkdir -p /etc/NetworkManager/conf.d
-    if ! grep -q '^enabled=false' /etc/NetworkManager/conf.d/90-disable-connectivity.conf 2>/dev/null; then
-        cat > /etc/NetworkManager/conf.d/90-disable-connectivity.conf << 'CONF'
-[connectivity]
-enabled=false
-CONF
-        info "  - 连通性检测: 已禁用"
-    else
+    # 连通性检测: 在 /etc/NetworkManager/NetworkManager.conf 追加 [connectivity] 段
+    #   (幂等: 键已存在则跳过; 旧方案 conf.d 独立文件统一移除, 避免双写)
+    local NM_CONF="/etc/NetworkManager/NetworkManager.conf"
+    rm -f /etc/NetworkManager/conf.d/90-disable-connectivity.conf 2>/dev/null || true
+    if grep -q '^enabled=false' "$NM_CONF" 2>/dev/null; then
         info "  - 连通性检测: 已禁用 (跳过)"
-    fi
-
-    # 幂等: 配置已就位时跳过 NM 重启 (避免反复断网)
-    if [[ ! -f /etc/NetworkManager/conf.d/90-disable-connectivity.conf ]] \
-       || ! grep -q '^enabled=false' /etc/NetworkManager/conf.d/90-disable-connectivity.conf 2>/dev/null; then
+    else
+        printf '\n[connectivity]\nenabled=false\n' >> "$NM_CONF"
+        info "  - 连通性检测: 已禁用 (NetworkManager.conf 追加 [connectivity])"
         systemctl restart NetworkManager 2>/dev/null || true
         info "  - NetworkManager 已重启"
     fi

@@ -1,0 +1,143 @@
+{
+  "logo": {
+    "source": "~/.config/fastfetch/png/nyarch.png",
+    "padding": {
+      "top": 4,
+      "left": 2,
+      "right": 5
+    },
+    "height": 15
+  },
+  "display": {
+    "separator": " "
+  },
+  "modules": [
+    "break",
+    {
+      "type": "title",
+      "format": "\u001b[31m{user-name}\u001b[0m@\u001b[31m{host-name}\u001b[0m       \u001b[31mI\u001b[0m \u001b[32mu\u001b[0m\u001b[33ms\u001b[0m\u001b[34me\u001b[0m \u001b[35m \u001b[0m\u001b[36mA\u001b[0m\u001b[31mr\u001b[0m\u001b[32mc\u001b[0m\u001b[33mh\u001b[0m \u001b[34m \u001b[0m\u001b[35mb\u001b[0m\u001b[36mt\u001b[0m\u001b[31mw\u001b[0m \u001b[32m \u001b[0m\u001b[33m:\u001b[0m\u001b[34m3\u001b[0m",
+      "color": {
+        "user": "cyan",
+        "at": "white",
+        "host": "cyan"
+      }
+    },
+    {
+      "type": "os",
+      "key": " OS",
+      "keyColor": "yellow"
+    },
+    {
+      "type": "kernel",
+      "key": "├ Kernel",
+      "keyColor": "yellow"
+    },
+    {
+      "type": "packages",
+      "key": "├󰏖 Packages",
+      "keyColor": "yellow"
+    },
+    {
+      "type": "shell",
+      "key": "├ Shell",
+      "keyColor": "yellow"
+    },
+    {
+      "type": "uptime",
+      "key": "└ Uptime",
+      "keyColor": "yellow"
+    },
+    "break",
+    {
+      "type": "de",
+      "key": " DE",
+      "keyColor": "blue"
+    },
+    {
+      "type": "wm",
+      "key": "├ Window Manager",
+      "keyColor": "blue"
+    },
+    {
+      "type": "lm",
+      "key": "├ Login Manager",
+      "keyColor": "blue"
+    },
+    {
+      "type": "wmtheme",
+      "key": "├󰉼 WM Theme",
+      "keyColor": "blue"
+    },
+    {
+      "type": "theme",
+      "key": "├󰉼 Color Themes",
+      "keyColor": "blue",
+      "format": "{theme1}"
+    },
+    {
+      "type": "icons",
+      "key": "├󰀻 System Icons",
+      "keyColor": "blue",
+      "format": "{icons1}"
+    },
+    {
+      "type": "font",
+      "key": "├ System Fonts",
+      "keyColor": "blue",
+      "format": "{font1}"
+    },
+    {
+      "type": "terminal",
+      "key": "└ Terminal",
+      "keyColor": "blue"
+    },
+    "break",
+    {
+      "type": "chassis",
+      "key": "󰌢 PC",
+      "keyColor": "green"
+    },
+    {
+      "type": "battery",
+      "key": "├ Battery",
+      "keyColor": "green"
+    },
+    {
+      "type": "memory",
+      "key": "├ Memory",
+      "keyColor": "green",
+      "percent": {
+        "type": 3,
+        "green": 30,
+        "yellow": 70
+      }
+    },
+    {
+      "type": "cpu",
+      "key": "├󰻠 CPU",
+      "keyColor": "green",
+      "temp": true
+    },
+    {
+      "type": "gpu",
+      "key": "├󰍛 GPU",
+      "keyColor": "green",
+      "temp": true
+    },
+    {
+      "type": "opengl",
+      "key": "├󰍛 OpenGL",
+      "keyColor": "green"
+    },
+    {
+      "type": "vulkan",
+      "key": "├󰍛 Vulkan",
+      "keyColor": "green"
+    },
+    {
+      "type": "display",
+      "key": "└󰍹 Display(s)",
+      "keyColor": "green"
+    }
+  ]
+}
