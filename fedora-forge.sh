@@ -2124,6 +2124,16 @@ setup_steam() {
 #  main
 # ============================================================================
 main() {
+    # ── 流程日志: 全程输出写入用户文档目录 (方便事后查改) ──
+    local LOG_DIR LOG_FILE
+    LOG_DIR="${ACTUAL_HOME}/文档/fedora-forge-logs"
+    [[ -d "${ACTUAL_HOME}/文档" ]] || LOG_DIR="${ACTUAL_HOME}/Documents/fedora-forge-logs"
+    mkdir -p "$LOG_DIR" 2>/dev/null || LOG_DIR="/tmp/fedora-forge-logs"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    LOG_FILE="${LOG_DIR}/fedora-forge-$(date +%Y%m%d-%H%M%S).log"
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    chown "$ACTUAL_USER" "$LOG_DIR" "$LOG_FILE" 2>/dev/null || true
+    echo -e "${CYAN}📄 流程日志: ${LOG_FILE}${NC}"
     echo -e "${BOLD}"
     echo "  ╔══════════════════════════════════════════════╗"
     echo "  ║       Fedora Forge 全面初始化脚本 v4.3       ║"
@@ -2181,6 +2191,11 @@ main() {
     echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════${NC}"
     echo -e "${GREEN}${BOLD}  ✅ 全部完成!${NC}"
     echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${CYAN}──────────────────────────────────────────────────${NC}"
+    echo -e "${CYAN}  📄 本次完整流程日志已保存 (含每一步操作明细):${NC}"
+    echo -e "${CYAN}     ${LOG_FILE}${NC}"
+    echo -e "${CYAN}──────────────────────────────────────────────────${NC}"
     echo ""
     echo -e "  重启后验证:"
     echo -e "  • NVIDIA:       ${CYAN}nvidia-smi${NC}"
