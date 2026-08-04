@@ -124,6 +124,12 @@ done
 # 默认不执行 -steam，仅执行核心模块
 [[ "$HAS_MODULE" -eq 0 ]] && { RUN_SOURCE=1; RUN_GPU=1; RUN_TERM=1; RUN_THEME=1; RUN_APPS=1; }
 
+# 校验电源方案取值 (非法值回退交互选择)
+case "$POWER_MODE" in
+    ask|auto|default) : ;;
+    *) warn "无效电源方案: $POWER_MODE (可选 auto/default/ask), 回退交互选择"; POWER_MODE="ask" ;;
+esac
+
 # ────────────────────────────────────────────── 权限 & 环境检测
 # 测试模式 (-test) 是只读演练, 所有写操作已被拦截, 无需真实 root
 if [[ "$TEST_MODE" -eq 0 ]]; then
@@ -675,6 +681,16 @@ SRCSCRIPT
 optimize_gpu() {
     step "3/7 CPU/GPU驱动 + 电源方案 + 音视频解码"
 
+    # 模块依赖自检: NVIDIA VA-API 桥接/部分解码包来自 rpmfusion,
+    #  单独执行 -gpu (未跑 -source) 时自动补装, 避免解码器装不上 (幂等)
+    if ! rpm -q rpmfusion-free-release >/dev/null 2>&1; then
+        info "检测到 rpmfusion 未启用 (-gpu 的解码器/驱动包依赖它), 自动安装..."
+        "$DNF" install -y \
+            "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA_VER}.noarch.rpm" \
+            "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${FEDORA_VER}.noarch.rpm" \
+            >/dev/null 2>&1 || warn "rpmfusion 安装失败, 部分解码器/驱动包可能不可用 (建议先执行 -source)"
+    fi
+
     local GPU_INFO HAS_NVIDIA=0 HAS_AMD=0 HAS_INTEL=0
     GPU_INFO=$(lspci -nn 2>/dev/null | grep -iE "VGA|3D|Display" || true)
     # 用 lspci -nn 的厂商 ID 检测 (描述文字不可靠: "Corporation" 含 "ati",
@@ -947,8 +963,7 @@ EOF
         echo 'force_drivers+=" nvidia nvidia_modeset nvidia_uvm nvidia_drm "' > /etc/dracut.conf.d/90-gpu.conf
         # VA-API 视频硬解桥接
         dnf_install_quiet libva-nvidia-driver vdpauinfo || true
-        dracut --force 2>/dev/null || true
-        info "✅ NVIDIA 配置完成 (modeset=1 + nouveau 黑名单 + initramfs 重建)"
+        info "✅ NVIDIA 配置完成 (modeset=1 + nouveau 黑名单)"
     fi
 
     # ── AMD ──
