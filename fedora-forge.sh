@@ -1,14 +1,15 @@
 #!/bin/bash
 # ============================================================================
-#  Fedora Forge — Fedora 44+ 全面初始化 & 优化脚本 v4.2
+#  Fedora Forge — Fedora 44+ 全面初始化 & 优化脚本 v4.3
 #  (dnf5 / KDE Plasma)
 #  ---------------------------------------------------------------------------
 #  模块:
 #    1. 软件源优化   — 多站并发测速 + RPM Fusion + Flathub + 开机自启
-#    2. 系统升级检查 — 内核模块完整性 + 全量升级 (首次需重启后二次运行)
-#    3. CPU/GPU驱动  — 自动识别 NVIDIA/AMD/Intel, 安装对应驱动
+#    2. 系统升级检查 — 仅全量运行(-all/无参数)时执行; 单模块执行自动跳过
+#    3. CPU/GPU驱动  — 自动识别 NVIDIA/AMD/Intel (厂商ID), 安装对应驱动+配套解码
 #                    — NVIDIA 固定生产版 595.80 (open 模块, 默认钉死; FF_NV_VERSION 可换)
-#                    — 电源方案选择: 系统默认(amd-pstate EPP) / auto-cpufreq
+#                    — 电源管理: 默认官方方案; 笔记本询问是否装 auto-cpufreq
+#                    — 装 auto-cpufreq 时生成回退官方方案脚本 (~/.local/scripts/power-official.sh)
 #                    — 音视频解码
 #    4. 终端配置     — 字体 + Zsh/Starship/Zinit + Konsole/Kitty
 #    5. 主题&系统    — Breeze主题 + 登录背景 + SELinux + GRUB
@@ -24,6 +25,8 @@
 #    sudo bash fedora-forge.sh -source -gpu # 只执行指定模块
 #    sudo bash fedora-forge.sh -all         # 执行全部模块(含 Steam)
 #    sudo bash fedora-forge.sh -h           # 帮助
+#  未知模块名将直接报错退出, 不会自动执行
+#  所有 GitHub 连接直连失败后自动走 https://gh-proxy.com/ 镜像
 # ============================================================================
 set -uo pipefail
 
@@ -37,12 +40,44 @@ warn()  { echo -e "${YELLOW}[注意]${NC}  $*"; }
 error() { echo -e "${RED}[错误]${NC} $*"; }
 die()   { error "$1"; exit 1; }
 
+# ────────────────────────────────────────────── GitHub 加速通道 (gh-proxy.com)
+# 国内网络直连 GitHub 不稳定 (clone/API/下载均可能失败):
+# 所有 GitHub 操作先直连, 失败后自动走 https://gh-proxy.com/ 镜像重试
+GHPROXY="https://gh-proxy.com/"
+
+# gh_clone <仓库路径 user/repo> <目标目录> — git clone 带镜像回退
+gh_clone() {
+    local repo="$1" dir="$2"
+    if git clone --depth=1 "https://github.com/${repo}" "$dir" >/dev/null 2>&1; then
+        return 0
+    fi
+    info "GitHub 直连失败, 走 gh-proxy.com 镜像克隆 ${repo}..."
+    git clone --depth=1 "${GHPROXY}https://github.com/${repo}" "$dir" >/dev/null 2>&1
+}
+
+# gh_curl <URL> [curl附加参数...] — curl 带镜像回退, 结果输出到 stdout
+#   用法: gh_curl "URL" --connect-timeout 10 | grep ...    (取数据)
+#         gh_curl "URL" > /tmp/file.tar.gz                  (下载文件)
+gh_curl() {
+    local url="$1"; shift
+    local tmp; tmp=$(mktemp)
+    if curl -fL --retry 2 "$@" "$url" -o "$tmp" >/dev/null 2>&1; then
+        cat "$tmp"; rm -f "$tmp"; return 0
+    fi
+    info "GitHub 直连失败, 走 gh-proxy.com 镜像: ${url}"
+    if curl -fL --retry 2 "$@" "${GHPROXY}${url}" -o "$tmp" >/dev/null 2>&1; then
+        cat "$tmp"; rm -f "$tmp"; return 0
+    fi
+    rm -f "$tmp"; return 1
+}
+
 # ────────────────────────────────────────────── 参数解析
 RUN_SOURCE=0; RUN_GPU=0; RUN_TERM=0; RUN_THEME=0; RUN_APPS=0; RUN_STEAM=0
 RUN_UPGRADE=1
-# 电源管理方案: ask=交互选择(默认) / auto=auto-cpufreq / default=系统默认(amd-pstate EPP)
+# 电源管理方案: ask=交互选择(默认, 笔记本询问) / auto=auto-cpufreq / default=系统默认(官方)
 POWER_MODE="${FF_POWER:-ask}"
 HAS_MODULE=0
+RUN_ALL=0
 
 # 测试模式: 仅验证流程与配置落盘, 不执行真实 dnf/flatpak/重启 (防误伤真实系统)
 TEST_MODE="${FF_TEST:-0}"
@@ -61,7 +96,7 @@ for arg in "$@"; do
         -test)    : ;; # 已在上面启用 TEST_MODE
         -all)
             RUN_SOURCE=1; RUN_GPU=1; RUN_TERM=1
-            RUN_THEME=1; RUN_APPS=1; RUN_STEAM=1; HAS_MODULE=1 ;;
+            RUN_THEME=1; RUN_APPS=1; RUN_STEAM=1; HAS_MODULE=1; RUN_ALL=1 ;;
         -h|-help|--help)
             echo "用法: sudo bash $0 [模块...]"
             echo ""
@@ -76,9 +111,9 @@ for arg in "$@"; do
             echo "  -all      执行全部模块 (含 Steam)"
             echo "  -test     测试模式: 不装包、不重启, 仅验证流程"
             echo "  -no-upgrade 跳过系统升级检查 (默认自动升级)"
-            echo "  -power=auto|default  电源方案: auto-cpufreq(推荐) / 系统默认(amd-pstate EPP)"
+            echo "  -power=auto|default  电源方案: 系统默认(官方) / auto-cpufreq"
             exit 0 ;;
-        *) warn "未知参数: $arg" ;;
+        *) die "未知模块/参数: $arg (用 -h 查看可用模块, 未指定模块时将执行核心模块)" ;;
     esac
 done
 
@@ -316,20 +351,20 @@ install_github_rpm() {
     fi
     info "安装 $name (GitHub latest)..."
     local url=""
-    # 通道一: api.github.com
-    url=$(curl -fsSL --connect-timeout 10 --max-time 25 \
-        "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+    # 通道一: api.github.com (直连失败自动走 gh-proxy.com 镜像)
+    url=$(gh_curl "https://api.github.com/repos/${repo}/releases/latest" \
+        --connect-timeout 10 --max-time 25 \
         | grep -o '"browser_download_url": *"[^"]*"' | cut -d '"' -f 4 \
         | grep -E "$pattern" | head -1)
     # 通道二: github.com expanded_assets (api 403/不可达时回退)
     if [[ -z "$url" ]]; then
         local tag=""
-        tag=$(curl -fsSI --connect-timeout 10 --max-time 20 \
-            "https://github.com/${repo}/releases/latest" 2>/dev/null \
+        tag=$(gh_curl "https://github.com/${repo}/releases/latest" \
+            -fsSI --connect-timeout 10 --max-time 20 \
             | grep -i '^location' | sed 's|.*/tag/||' | tr -d '\r')
         if [[ -n "$tag" ]]; then
-            url=$(curl -fsSL --connect-timeout 10 --max-time 25 \
-                "https://github.com/${repo}/releases/expanded_assets/${tag}" 2>/dev/null \
+            url=$(gh_curl "https://github.com/${repo}/releases/expanded_assets/${tag}" \
+                --connect-timeout 10 --max-time 25 \
                 | grep -oE 'href="/[^"]*\.(rpm|deb)"' | sed 's|href="/|https://github.com/|; s|"$||' \
                 | grep -E "$pattern" | head -1)
         fi
@@ -599,18 +634,18 @@ optimize_gpu() {
         systemctl mask "$svc.service" 2>/dev/null || true
     }
 
-    # ── 电源管理方案: auto-cpufreq / 系统默认 ──
+    # ── 电源管理方案 (默认官方; 仅笔记本询问是否装 auto-cpufreq) ──
     if [[ "$POWER_MODE" == "ask" ]]; then
         if compgen -G "/sys/class/power_supply/BAT*" >/dev/null 2>&1; then
             echo ""
-            echo -e "  ${CYAN}电源管理方案${NC} (独显直连功耗较高, 建议 auto-cpufreq):"
-            echo "    1) auto-cpufreq 自动调频优化  [默认, 回车直接选]"
-            echo "    2) 系统默认 (power-profiles-daemon + amd-pstate EPP)"
+            echo -e "  ${CYAN}电源管理方案${NC} (检测到笔记本, 有电池):"
+            echo "    1) 系统默认 (power-profiles-daemon + amd-pstate EPP)  [官方默认, 回车直接选]"
+            echo "    2) auto-cpufreq (自动调频优化)"
             read -r -p "  请选择 [1/2]: " POWER_CHOICE
-            POWER_MODE="auto"
-            [[ "$POWER_CHOICE" == "2" ]] && POWER_MODE="default"
+            POWER_MODE="default"
+            [[ "$POWER_CHOICE" == "2" ]] && POWER_MODE="auto"
         else
-            info "检测到台式机 (无电池), 使用系统默认电源管理"
+            info "检测到台式机 (无电池), 使用系统默认电源管理 (官方)"
             POWER_MODE="default"
         fi
     fi
@@ -653,7 +688,7 @@ optimize_gpu() {
     else
         info "克隆 auto-cpufreq 仓库..."
         rm -rf "$AUTO_CPUFREQ_DIR"
-        git clone --depth=1 https://github.com/AdnanHodzic/auto-cpufreq.git "$AUTO_CPUFREQ_DIR" 2>/dev/null || \
+        gh_clone "AdnanHodzic/auto-cpufreq" "$AUTO_CPUFREQ_DIR" || \
             warn "auto-cpufreq 克隆失败"
     fi
 
@@ -707,6 +742,29 @@ EOF
                 # PATH 链接: 官方安装器不建 /usr/bin 链接, 用户终端才能直接敲 auto-cpufreq
                 if [[ ! -e /usr/local/bin/auto-cpufreq ]]; then
                     ln -sf "$VENV/bin/auto-cpufreq" /usr/local/bin/auto-cpufreq 2>/dev/null || true
+                fi
+
+                # 回退官方方案脚本: 停用 auto-cpufreq, 恢复系统默认电源管理
+                mkdir -p "${ACTUAL_HOME}/.local/scripts" 2>/dev/null || true
+                if [[ -d "${ACTUAL_HOME}/.local/scripts" ]]; then
+                    cat > "${ACTUAL_HOME}/.local/scripts/power-official.sh" <<'EOF'
+#!/bin/bash
+# 回退到系统官方电源管理 (停用 auto-cpufreq, 恢复 power-profiles-daemon + tuned)
+set -e
+echo "==> 停用 auto-cpufreq 服务..."
+sudo systemctl stop auto-cpufreq 2>/dev/null || true
+sudo systemctl disable auto-cpufreq 2>/dev/null || true
+sudo systemctl mask auto-cpufreq 2>/dev/null || true
+echo "==> 恢复官方电源服务 (power-profiles-daemon + tuned)..."
+sudo systemctl unmask power-profiles-daemon 2>/dev/null || true
+sudo systemctl enable --now power-profiles-daemon 2>/dev/null || true
+sudo systemctl unmask tuned 2>/dev/null || true
+sudo systemctl enable --now tuned 2>/dev/null || true
+echo "==> 完成! 当前为官方电源方案 (powerprofilesctl status 查看)"
+EOF
+                    chmod +x "${ACTUAL_HOME}/.local/scripts/power-official.sh"
+                    chown "$ACTUAL_USER" "${ACTUAL_HOME}/.local/scripts/power-official.sh" 2>/dev/null || true
+                    info "✅ 回退官方方案脚本: ${ACTUAL_HOME}/.local/scripts/power-official.sh (随时可运行回退)"
                 fi
 
                 info "auto-cpufreq 状态:"
@@ -953,8 +1011,7 @@ setup_terminal() {
         info "安装 starship 提示符..."
         mkdir -p "${ACTUAL_HOME}/.local/bin"
         timeout 300 su - "$ACTUAL_USER" -c "curl -fsSL https://starship.rs/install.sh | sh -s -- -y" >/dev/null 2>&1 || \
-        timeout 240 curl -fsSL -o /tmp/starship.tar.gz \
-            "https://github.com/starship/starship/releases/latest/download/starship-x86_64-unknown-linux-gnu.tar.gz" \
+        timeout 240 gh_curl "https://github.com/starship/starship/releases/latest/download/starship-x86_64-unknown-linux-gnu.tar.gz" > /tmp/starship.tar.gz \
             && tar -xzf /tmp/starship.tar.gz -C "${ACTUAL_HOME}/.local/bin" starship \
             && chmod +x "${ACTUAL_HOME}/.local/bin/starship" 2>/dev/null || true
         rm -f /tmp/starship.tar.gz
@@ -968,8 +1025,11 @@ setup_terminal() {
     # zinit 插件管理器 (GitHub 直连克隆; 以用户身份执行, 避免 root 归属)
     if [[ ! -f "${ACTUAL_HOME}/.local/share/zinit/zinit.git/zinit.zsh" ]]; then
         info "克隆 zinit 插件管理器..."
-        su - "$ACTUAL_USER" -c "mkdir -p ~/.local/share/zinit && git clone --depth=1 https://github.com/zdharma-continuum/zinit.git ~/.local/share/zinit/zinit.git" 2>/dev/null || \
-            warn "zinit 克隆失败 (可手动: git clone https://github.com/zdharma-continuum/zinit.git ~/.local/share/zinit/zinit.git)"
+        if ! su - "$ACTUAL_USER" -c "mkdir -p ~/.local/share/zinit && git clone --depth=1 https://github.com/zdharma-continuum/zinit.git ~/.local/share/zinit/zinit.git" >/dev/null 2>&1; then
+            info "zinit 直连失败, 走 gh-proxy.com 镜像..."
+            su - "$ACTUAL_USER" -c "mkdir -p ~/.local/share/zinit && git clone --depth=1 https://gh-proxy.com/https://github.com/zdharma-continuum/zinit.git ~/.local/share/zinit/zinit.git" >/dev/null 2>&1 || \
+                warn "zinit 克隆失败 (可手动: git clone https://github.com/zdharma-continuum/zinit.git ~/.local/share/zinit/zinit.git)"
+        fi
     fi
 
     # 写入 .zshrc (中文注释, 实用向: 建议/高亮/fzf-tab/zoxide/eza)
@@ -1284,8 +1344,9 @@ KONPROF
         info "✅ Kitty 方案已配置 (跳过)"
     else
         local KITTY_OK=0
-        # 在线: GitHub 克隆
-        if su - "$ACTUAL_USER" -c "git clone --depth=1 https://github.com/Sidharth7082/kitty.git /tmp/kitty-style" 2>/dev/null \
+        # 在线: GitHub 克隆 (直连失败走 gh-proxy.com 镜像)
+        if { su - "$ACTUAL_USER" -c "git clone --depth=1 https://github.com/Sidharth7082/kitty.git /tmp/kitty-style" >/dev/null 2>&1 \
+             || su - "$ACTUAL_USER" -c "git clone --depth=1 https://gh-proxy.com/https://github.com/Sidharth7082/kitty.git /tmp/kitty-style" >/dev/null 2>&1; } \
            && [[ -f /tmp/kitty-style/kitty/kitty.conf ]]; then
             deploy_kitty_dir "/tmp/kitty-style/kitty" "/tmp/kitty-style/kitty/themes"
             rm -rf /tmp/kitty-style
@@ -1581,7 +1642,7 @@ LOGIN
         else
             # 在线: GitHub 克隆 (网络优先)
             info "下载 CyberGRUB-2077 (GitHub)..."
-            if git clone --depth=1 https://github.com/adnksharp/CyberGRUB-2077.git /tmp/cybergrub 2>/dev/null; then
+            if gh_clone "adnksharp/CyberGRUB-2077" /tmp/cybergrub; then
                 # 仓库结构: 主题文件在子目录 CyberGRUB-2077/
                 local theme_src_dir=""
                 if [[ -d /tmp/cybergrub/CyberGRUB-2077 ]]; then
@@ -1771,7 +1832,9 @@ FC
         while (( RIME_TRY < 2 )); do
             (( RIME_TRY++ ))
             rm -rf "$RIME_DIR" 2>/dev/null
-            if su - "$ACTUAL_USER" -c "git clone --depth=1 https://github.com/iDvel/rime-ice.git '${RIME_DIR}'" 2>/dev/null \
+            # 直连失败自动走 gh-proxy.com 镜像
+            if { su - "$ACTUAL_USER" -c "git clone --depth=1 https://github.com/iDvel/rime-ice.git '${RIME_DIR}'" >/dev/null 2>&1 \
+                 || su - "$ACTUAL_USER" -c "git clone --depth=1 https://gh-proxy.com/https://github.com/iDvel/rime-ice.git '${RIME_DIR}'" >/dev/null 2>&1; } \
                && [[ -f "$RIME_DIR/default.yaml" ]]; then
                 RIME_OK=1
                 break
@@ -1824,9 +1887,8 @@ FC
         local RIME_GRAM="$RIME_DIR/wanxiang-lts-zh-hans.gram"
         if [[ ! -f "$RIME_GRAM" ]]; then
             info "下载万象语法模型 (wanxiang-lts-zh-hans.gram)..."
-            if curl -fL --retry 2 --connect-timeout 20 --max-time 600 \
-                -o "$RIME_GRAM" \
-                "https://github.com/amzxyz/RIME-LMDG/releases/download/LTS/wanxiang-lts-zh-hans.gram" 2>/dev/null \
+            if gh_curl "https://github.com/amzxyz/RIME-LMDG/releases/download/LTS/wanxiang-lts-zh-hans.gram" \
+                --connect-timeout 20 --max-time 600 > "$RIME_GRAM" \
                && [[ -s "$RIME_GRAM" ]]; then
                 info "✅ 万象语法模型下载完成 ($(du -h "$RIME_GRAM" | cut -f1))"
             else
@@ -1926,7 +1988,8 @@ REPO
         # fetch version information"); 改经 /releases/latest 的 Location 重定向解析
         # 最新版本(纯 github.com), 再以 export VERSION= 传回官方脚本使其跳过 API。
         local OC_VER="" OC_ATTEMPT=0 OC_OK=0
-        OC_VER=$(curl -fsSI --max-time 15 "https://github.com/anomalyco/opencode/releases/latest" 2>/dev/null \
+        OC_VER=$(gh_curl "https://github.com/anomalyco/opencode/releases/latest" \
+            -fsSI --max-time 15 \
             | tr -d '\r' | sed -n 's#.*[Tt]ag/[vV]\([0-9][0-9.]*\).*#\1#p' | head -1)
         if [[ -n "$OC_VER" ]]; then
             while (( OC_ATTEMPT < 2 )); do
@@ -1980,8 +2043,8 @@ REPO
     # ── Anki (tar.zst) ──
     if ! command -v anki >/dev/null 2>&1; then
         info "安装 Anki..."
-        curl -fsSL --retry 2 --connect-timeout 20 -o /tmp/anki.tar.zst \
-            "https://github.com/ankitects/anki/releases/download/26.08/anki-26.08-linux-x86_64.tar.zst" 2>/dev/null && {
+        gh_curl "https://github.com/ankitects/anki/releases/download/26.08/anki-26.08-linux-x86_64.tar.zst" \
+            --connect-timeout 20 > /tmp/anki.tar.zst && {
             rm -rf /tmp/anki-extract
             mkdir -p /tmp/anki-extract
             tar -xf /tmp/anki.tar.zst -C /tmp/anki-extract 2>/dev/null
@@ -2063,7 +2126,7 @@ setup_steam() {
 main() {
     echo -e "${BOLD}"
     echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║       Fedora Forge 全面初始化脚本 v4.2       ║"
+    echo "  ║       Fedora Forge 全面初始化脚本 v4.3       ║"
     echo "  ║            KDE Plasma Edition               ║"
     echo "  ╚══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -2081,15 +2144,20 @@ main() {
     fi
 
     info "将执行以下模块:"
+    # 单模块执行时跳过系统升级检查 (冗余); 仅全量(-all/无参数)运行
+    local DO_UPGRADE=0
+    if [[ "$RUN_UPGRADE" -eq 1 && ( "$HAS_MODULE" -eq 0 || "$RUN_ALL" -eq 1 ) ]]; then
+        DO_UPGRADE=1
+    fi
     [[ "$RUN_SOURCE" -eq 1 ]] && echo -e "  ${GREEN}✓${NC} 软件源优化"
-    [[ "$RUN_UPGRADE" -eq 1 ]] && echo -e "  ${GREEN}✓${NC} 系统升级检查 ${YELLOW}(全量升级+重启检测)${NC}"
+    [[ "$DO_UPGRADE" -eq 1 ]] && echo -e "  ${GREEN}✓${NC} 系统升级检查 ${YELLOW}(全量升级+重启检测)${NC}"
     [[ "$RUN_GPU" -eq 1 ]]    && echo -e "  ${GREEN}✓${NC} CPU/GPU驱动 + 电源方案(默认/auto-cpufreq) + 解码"
     [[ "$RUN_TERM" -eq 1 ]]   && echo -e "  ${GREEN}✓${NC} 终端配置"
     [[ "$RUN_THEME" -eq 1 ]]  && echo -e "  ${GREEN}✓${NC} 主题 & 系统优化 (含 NM 优化)"
     [[ "$RUN_APPS" -eq 1 ]]   && echo -e "  ${GREEN}✓${NC} 应用管理"
     [[ "$RUN_STEAM" -eq 1 ]]  && echo -e "  ${GREEN}✓${NC} 32位库 + Steam ${YELLOW}(可选模块)${NC}"
     echo ""
-    [[ "$RUN_UPGRADE" -eq 1 ]] && echo -e "  ${YELLOW}注意: 若检测到可用更新, 将先全量升级; 升级内核后需重启并再次运行脚本${NC}"
+    [[ "$DO_UPGRADE" -eq 1 ]] && echo -e "  ${YELLOW}注意: 若检测到可用更新, 将先全量升级; 升级内核后需重启并再次运行脚本${NC}"
     echo ""
     echo -e "  按 ${YELLOW}Ctrl+C${NC} 取消, 或等待 5 秒后自动开始..."
     sleep 5
@@ -2097,7 +2165,7 @@ main() {
     wait_rpm
 
     [[ "$RUN_SOURCE" -eq 1 ]] && optimize_sources
-    system_upgrade_check
+    [[ "$DO_UPGRADE" -eq 1 ]] && system_upgrade_check
     [[ "$RUN_GPU" -eq 1 ]]    && optimize_gpu
     [[ "$RUN_TERM" -eq 1 ]]   && setup_terminal
     [[ "$RUN_THEME" -eq 1 ]]  && apply_theme
