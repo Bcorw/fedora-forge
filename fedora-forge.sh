@@ -1250,14 +1250,8 @@ ZSHRC
         fi
         dnf_install_quiet yazi || warn "Yazi 安装失败"
     fi
-    # 图片/视频预览依赖 (Fedora 官方仓库无此包, 从开发者 COPR 安装; 失败不影响其他功能)
-    if ! rpm -q ueberzugpp >/dev/null 2>&1; then
-        if dnf copr enable -y jstkdng/ueberzugpp >/dev/null 2>&1; then
-            dnf_ensure ueberzugpp || info "ueberzugpp 安装失败 (COPR 可达但包不可用), Yazi 图片预览不可用"
-        else
-            info "ueberzugpp 未安装 (COPR 不可达, Yazi 图片预览不可用, 不影响其他功能)"
-        fi
-    fi
+    # Yazi 图片预览依赖 (ueberzugpp): 可选, 非必需 — 官方仓库无包且需 COPR,
+    # 需要时用户可自行安装: sudo dnf copr enable jstkdng/ueberzugpp && sudo dnf install ueberzugpp
     # 初始化 Yazi 配置目录 (首次启动由 yazi 自行生成默认配置)
     ensure_user_dir "$ACTUAL_HOME/.config/yazi"
 
