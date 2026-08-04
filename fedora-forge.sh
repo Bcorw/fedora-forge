@@ -1,12 +1,14 @@
 #!/bin/bash
 # ============================================================================
-#  Fedora Forge — Fedora 44+ 全面初始化 & 优化脚本 v4.0
+#  Fedora Forge — Fedora 44+ 全面初始化 & 优化脚本 v4.1
 #  (dnf5 / KDE Plasma)
 #  ---------------------------------------------------------------------------
 #  模块:
 #    1. 软件源优化   — 多站并发测速 + RPM Fusion + Flathub + 开机自启
 #    2. 系统升级检查 — 内核模块完整性 + 全量升级 (首次需重启后二次运行)
-#    3. CPU/GPU驱动  — NVIDIA/AMD + auto-cpufreq电源管理 + 音视频解码
+#    3. CPU/GPU驱动  — NVIDIA 官方595生产分支(open模块) / AMD
+#                    — 电源方案选择: 系统默认(amd-pstate EPP) / auto-cpufreq
+#                    — 音视频解码
 #    4. 终端配置     — 字体 + Zsh/Starship/Zinit + Konsole/Kitty
 #    5. 主题&系统    — Breeze主题 + 登录背景 + SELinux + GRUB
 #                    — NetworkManager优化 (wait-online + 连通性检测)
@@ -37,6 +39,8 @@ die()   { error "$1"; exit 1; }
 # ────────────────────────────────────────────── 参数解析
 RUN_SOURCE=0; RUN_GPU=0; RUN_TERM=0; RUN_THEME=0; RUN_APPS=0; RUN_STEAM=0
 RUN_UPGRADE=1
+# 电源管理方案: ask=交互选择(默认) / auto=auto-cpufreq / default=系统默认(amd-pstate EPP)
+POWER_MODE="${FF_POWER:-ask}"
 HAS_MODULE=0
 
 # 测试模式: 仅验证流程与配置落盘, 不执行真实 dnf/flatpak/重启 (防误伤真实系统)
@@ -52,6 +56,7 @@ for arg in "$@"; do
         -apps)    RUN_APPS=1;   HAS_MODULE=1 ;;
         -steam)   RUN_STEAM=1;  HAS_MODULE=1 ;;
         -no-upgrade) RUN_UPGRADE=0 ;;
+        -power=*)  POWER_MODE="${arg#-power=}" ;;
         -test)    : ;; # 已在上面启用 TEST_MODE
         -all)
             RUN_SOURCE=1; RUN_GPU=1; RUN_TERM=1
@@ -61,7 +66,7 @@ for arg in "$@"; do
             echo ""
             echo "模块 (可组合, 无参数=执行 1-6 核心模块):"
             echo "  -source   软件源优化"
-            echo "  -gpu      CPU/GPU驱动 + auto-cpufreq电源管理 + 音视频解码"
+            echo "  -gpu      CPU/GPU驱动(595生产分支) + 电源方案 + 音视频解码"
             echo "  -term     终端配置 (字体 + Zsh/Starship/Zinit + Konsole/Kitty)"
             echo "  -theme    主题 & 系统优化 (含 NetworkManager 优化)"
             echo "  -apps     应用管理 (卸载 + 安装)"
@@ -69,6 +74,7 @@ for arg in "$@"; do
             echo "  -all      执行全部模块 (含 Steam)"
             echo "  -test     测试模式: 不装包、不重启, 仅验证流程"
             echo "  -no-upgrade 跳过系统升级检查 (默认自动升级)"
+            echo "  -power=auto|default  电源方案: auto-cpufreq(推荐) / 系统默认(amd-pstate EPP)"
             exit 0 ;;
         *) warn "未知参数: $arg" ;;
     esac
@@ -566,10 +572,10 @@ SRCSCRIPT
 }
 
 # ============================================================================
-#  3/7  CPU/GPU驱动 + auto-cpufreq电源管理 + 音视频解码
+#  3/7  CPU/GPU驱动 + 电源方案(默认/auto-cpufreq) + 音视频解码
 # ============================================================================
 optimize_gpu() {
-    step "3/7 CPU/GPU驱动 + auto-cpufreq + 音视频解码"
+    step "3/7 CPU/GPU驱动 + 电源方案 + 音视频解码"
 
     local GPU_INFO HAS_NVIDIA=0 HAS_AMD=0
     GPU_INFO=$(lspci -nn 2>/dev/null | grep -iE "VGA|3D|Display" || true)
@@ -588,19 +594,48 @@ optimize_gpu() {
         systemctl mask "$svc.service" 2>/dev/null || true
     }
 
-    info "禁用系统默认电源管理服务..."
-    # power-profiles-daemon (与 auto-cpufreq 冲突)
-    disable_service power-profiles-daemon
-    # TLP
-    disable_service tlp
-    disable_service tlp-sleep
-    # tuned (Fedora 自带)
-    disable_service tuned
+    # ── 电源管理方案: auto-cpufreq / 系统默认 ──
+    if [[ "$POWER_MODE" == "ask" ]]; then
+        if compgen -G "/sys/class/power_supply/BAT*" >/dev/null 2>&1; then
+            echo ""
+            echo -e "  ${CYAN}电源管理方案${NC} (独显直连功耗较高, 建议 auto-cpufreq):"
+            echo "    1) auto-cpufreq 自动调频优化  [默认, 回车直接选]"
+            echo "    2) 系统默认 (power-profiles-daemon + amd-pstate EPP)"
+            read -r -p "  请选择 [1/2]: " POWER_CHOICE
+            POWER_MODE="auto"
+            [[ "$POWER_CHOICE" == "2" ]] && POWER_MODE="default"
+        else
+            info "检测到台式机 (无电池), 使用系统默认电源管理"
+            POWER_MODE="default"
+        fi
+    fi
 
-    # auto-cpufreq 仅对笔记本(有电池)有意义; 台式机收益低且可能与电源策略冲突
-    if ! compgen -G "/sys/class/power_supply/BAT*" >/dev/null 2>&1; then
-        info "检测到台式机 (无电池), 跳过 auto-cpufreq 安装"
+    if [[ "$POWER_MODE" == "default" ]]; then
+        info "电源方案: 系统默认 (power-profiles-daemon + amd-pstate EPP)"
+        systemctl unmask power-profiles-daemon 2>/dev/null || true
+        systemctl enable --now power-profiles-daemon 2>/dev/null || true
+        systemctl enable tuned 2>/dev/null || true
+        # AMD 硬件协调电源管理 (Zen4+/9955HX)
+        if [[ -d /sys/devices/system/cpu/amd_pstate ]] \
+           && [[ "$(cat /sys/devices/system/cpu/amd_pstate/status 2>/dev/null)" != "active" ]]; then
+            grubby --update-kernel=ALL --args="amd_pstate=active" 2>/dev/null || true
+            info "已添加内核参数 amd_pstate=active (重启后生效)"
+        fi
+        info "日常切换: powerprofilesctl set power-saver|balanced|performance"
     else
+        info "电源方案: auto-cpufreq (禁用系统默认电源服务)"
+        # power-profiles-daemon (与 auto-cpufreq 冲突)
+        disable_service power-profiles-daemon
+        # TLP
+        disable_service tlp
+        disable_service tlp-sleep
+        # tuned (Fedora 自带)
+        disable_service tuned
+
+        # auto-cpufreq 仅对笔记本(有电池)有意义; 台式机收益低且可能与电源策略冲突
+        if ! compgen -G "/sys/class/power_supply/BAT*" >/dev/null 2>&1; then
+            info "检测到台式机 (无电池), 跳过 auto-cpufreq 安装"
+        else
     info "安装 auto-cpufreq 依赖..."
     dnf_install_quiet python3-pip python3-devel python3-psutil python3-dbus \
         python3-gi gobject-introspection gobject-introspection-devel \
@@ -681,6 +716,7 @@ EOF
         fi
     fi
     fi
+    fi
 
     # ── 音视频解码 ──
     # rpmfusion 的 ffmpeg 与 Fedora 官方 ffmpeg-free* 系列 (ffmpeg-free/libavcodec-free/
@@ -705,63 +741,90 @@ EOF
         gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free \
         gstreamer1-libav gstreamer1-vaapi libva libva-utils || true
 
-    # ── NVIDIA ──
+    # ── NVIDIA: 官方生产分支 (595.x) + open 内核模块 ──
+    #  610.x = 新特性分支(测试版): 有显示管线回归 (color_pipeline 色斑/内屏黑屏/atomic commit 失败)
+    #  595.x = 生产稳定分支; Blackwell (RTX 50) 必须用 open 内核模块 (-M=open)
     if [[ "$HAS_NVIDIA" -eq 1 ]]; then
-        # 幂等: 驱动版本号存在即视为已安装, 跳过整个安装段 (二次执行秒过)
-        local NV_VER=""
-        NV_VER=$(modinfo -F version nvidia 2>/dev/null)
-        if [[ -n "$NV_VER" ]]; then
-            info "✅ NVIDIA 驱动已安装: $NV_VER (跳过安装/编译)"
+        local NV_VER NV_TARGET NV_LATEST NV_URL NV_RUN NV_SHA
+        NV_VER=$(modinfo -F version nvidia 2>/dev/null || true)
+
+        # 从 NVIDIA 官方获取生产分支最新版本 (latest.txt 指向 595.x)
+        NV_LATEST=$(curl -fs --max-time 30 "https://download.nvidia.com/XFree86/Linux-x86_64/latest.txt" 2>/dev/null | head -1 || true)
+        NV_TARGET=$(echo "$NV_LATEST" | awk '{print $1}')
+        NV_URL=$(echo "$NV_LATEST" | awk '{print $2}')
+        if [[ -z "$NV_TARGET" ]]; then
+            warn "无法获取 NVIDIA 官方最新版, 回退到已知稳定版 595.80"
+            NV_TARGET="595.80"
+            NV_URL="595.80/NVIDIA-Linux-x86_64-595.80.run"
+        fi
+        NV_RUN="/opt/nvidia/NVIDIA-Linux-x86_64-${NV_TARGET}.run"
+
+        if [[ -n "$NV_VER" && "$NV_VER" == "$NV_TARGET" ]]; then
+            info "✅ NVIDIA 驱动已是最新生产版 $NV_VER (跳过安装)"
         else
-            # Secure Boot 检测: akmod 驱动需要 MOK 密钥签名, 未注册时安装后无法加载
+            if [[ -n "$NV_VER" ]]; then
+                warn "检测到旧驱动 $NV_VER, 先卸载 rpmfusion 包..."
+                "$DNF" remove -y akmod-nvidia xorg-x11-drv-nvidia xorg-x11-drv-nvidia-cuda \
+                    xorg-x11-drv-nvidia-cuda-libs xorg-x11-drv-nvidia-libs \
+                    xorg-x11-drv-nvidia-power nvidia-settings kmod-nvidia \
+                    nvidia-modprobe nvidia-persistenced libva-nvidia-driver 2>/dev/null || true
+                dkms remove -m nvidia -v "$NV_VER" --all 2>/dev/null || true
+            fi
+
+            # Secure Boot 检测 (官方 DKMS 模块未签名无法加载)
             if command -v mokutil >/dev/null 2>&1 \
                && [[ "$(mokutil --sb-state 2>/dev/null)" == *"enabled"* ]]; then
                 warn "⚠ 检测到 Secure Boot 已启用!"
-                warn "  akmod-nvidia 需导入 MOK 密钥才能加载, 首次安装会提示设置密码并重启"
-                warn "  若忽略, nvidia-smi 将失败 (驱动已装但内核模块未签名)"
-                warn "  建议: 安装后执行 sudo mokutil --import /etc/pki/akmods/certs/public_key.der"
+                warn "  NVIDIA 官方驱动 DKMS 模块需签名才能加载, 建议 BIOS 关闭 Secure Boot"
+                warn "  或安装后执行: sudo mokutil --import /var/lib/dkms/mok.pub"
             fi
-            info "安装 NVIDIA 驱动 + CUDA..."
-            dnf_install_quiet akmod-nvidia xorg-x11-drv-nvidia-cuda \
-                xorg-x11-drv-nvidia-libs.i686 xorg-x11-drv-nvidia-cuda-libs.i686 || \
-                warn "NVIDIA 安装异常"
 
-            wait_rpm
-            "$DNF" mark user akmod-nvidia 2>/dev/null || true
-
-            # VA-API
-            dnf_install_quiet libva-nvidia-driver vdpauinfo || true
-
-            # akmods 编译: akmod-nvidia 可能拉到比运行内核更新的 kernel-devel 导致编译失败,
-            #  先确保与运行内核匹配的版本
-            local RUN_KERNEL
-            RUN_KERNEL=$(uname -r)
-            if ! rpm -q "kernel-devel-${RUN_KERNEL}" >/dev/null 2>&1; then
-                info "安装与运行内核匹配的 kernel-devel-${RUN_KERNEL}..."
-                dnf_install_quiet "kernel-devel-${RUN_KERNEL}" || \
-                    warn "kernel-devel-${RUN_KERNEL} 不可用, 系统可能未升级"
+            # 下载 + 校验
+            mkdir -p /opt/nvidia
+            if [[ ! -f "$NV_RUN" ]]; then
+                info "下载 NVIDIA $NV_TARGET (官方生产分支, ~400MB)..."
+                curl -fL --retry 3 -o "$NV_RUN" "https://download.nvidia.com/XFree86/Linux-x86_64/${NV_URL}" || \
+                    warn "驱动下载失败 (可稍后手动下载)"
             fi
-            systemctl enable --now akmods >/dev/null 2>&1 || true
-            akmods --force >/dev/null 2>&1 || true
-            info "等待 akmods 编译 (首次需几分钟)..."
-            for i in $(seq 1 30); do
-                modinfo -F version nvidia >/dev/null 2>&1 && break
-                sleep 8
-            done
-
-            local v
-            v=$(modinfo -F version nvidia 2>/dev/null)
-            if [[ -n "$v" ]]; then
-                info "NVIDIA 模块就绪: $v"
-            else
-                warn "nvidia 模块未就绪, 重启后验证"
-                if ! rpm -q "kernel-devel-${RUN_KERNEL}" >/dev/null 2>&1; then
-                    warn "提示: kernel-devel 与运行内核不匹配, 请先执行: sudo dnf upgrade --refresh && sudo reboot"
+            if [[ -f "$NV_RUN" ]]; then
+                NV_SHA=$(curl -fs --max-time 20 "https://download.nvidia.com/XFree86/Linux-x86_64/${NV_TARGET}/NVIDIA-Linux-x86_64-${NV_TARGET}.run.sha256sum" 2>/dev/null | awk '{print $1}' || true)
+                if [[ -n "$NV_SHA" ]] && ! echo "$NV_SHA  $NV_RUN" | sha256sum -c - >/dev/null 2>&1; then
+                    warn "⚠ 驱动校验失败, 删除后重新下载"
+                    rm -f "$NV_RUN"
+                else
+                    info "✅ 驱动文件校验通过"
                 fi
             fi
 
-            echo 'force_drivers+=" nvidia nvidia_modeset nvidia_uvm nvidia_drm "' > /etc/dracut.conf.d/90-gpu.conf
+            if [[ -f "$NV_RUN" ]]; then
+                info "安装 NVIDIA $NV_TARGET (open 内核模块 + DKMS, 静默模式)..."
+                # 关键参数: --kernel-module-type=open (Blackwell 必需) + --dkms (内核更新自动重编译)
+                if sh "$NV_RUN" --silent --dkms --kernel-module-type=open; then
+                    info "✅ NVIDIA $NV_TARGET (open 模块) 安装成功"
+                else
+                    warn "NVIDIA 安装失败, 可手动执行: sudo sh $NV_RUN --dkms --kernel-module-type=open"
+                fi
+            fi
         fi
+
+        # ── NVIDIA 配置 (幂等, 每次执行) ──
+        # modeset=1: Wayland/KMS 必需 (.run 安装器不生成此文件!)
+        cat > /etc/modprobe.d/nvidia.conf <<'EOF'
+options nvidia_drm modeset=1 fbdev=1
+EOF
+        # nouveau 黑名单 (防 nouveau 抢先绑定 GPU)
+        if [[ ! -f /etc/modprobe.d/blacklist-nouveau.conf ]]; then
+            cat > /etc/modprobe.d/blacklist-nouveau.conf <<'EOF'
+blacklist nouveau
+options nouveau modeset=0
+EOF
+        fi
+        # dracut 强制加载 nvidia 模块
+        echo 'force_drivers+=" nvidia nvidia_modeset nvidia_uvm nvidia_drm "' > /etc/dracut.conf.d/90-gpu.conf
+        # VA-API 视频硬解桥接
+        dnf_install_quiet libva-nvidia-driver vdpauinfo || true
+        dracut --force 2>/dev/null || true
+        info "✅ NVIDIA 配置完成 (modeset=1 + nouveau 黑名单 + initramfs 重建)"
     fi
 
     # ── AMD ──
@@ -1300,8 +1363,36 @@ KITTYFALLBACK
 # ============================================================================
 #  5/7  主题 & 系统优化 (含 NetworkManager 优化)
 # ============================================================================
+# ─────────────────────────────────────────────────────────────
+# 清理系统自带壁纸 (Fedora/KDE 预装, 仅保留用户自定义壁纸)
+cleanup_stock_wallpapers() {
+    info "清理系统自带壁纸..."
+    local -a STOCK=(
+        Altai Autumn BytheWater Canopee Cascade Cluster Coast ColdRipple
+        ColorfulCups DarkestHour Elarun EveningGlow FallenLeaf Fedora F44
+        Flow Grey Honeywave IceCold Kay Kite Kokkini MilkyWay Mountain
+        Nexus Nuvole OneStandsOut Opal Orionids PastelHills Patak Path
+        SafeLanding ScarletTree Shell Sub-Arctic Volna summer_1am FlyingKonqui
+    )
+    local removed=0
+    for w in "${STOCK[@]}"; do
+        if [[ -d "/usr/share/wallpapers/$w" ]]; then
+            rm -rf "/usr/share/wallpapers/$w"
+            ((removed++))
+        fi
+    done
+    if [[ $removed -gt 0 ]]; then
+        info "✅ 已删除 $removed 个系统自带壁纸"
+    else
+        info "系统壁纸已清理过 (0 个待删)"
+    fi
+}
+
 apply_theme() {
     step "5/7 主题 & 系统优化"
+
+    # ── 0) 清理系统自带壁纸 (仅保留用户自定义壁纸) ──
+    cleanup_stock_wallpapers
 
     # ── 1) KDE Breeze 微风主题 ──
     info "切换回 KDE Breeze 微风主题..."
@@ -1948,7 +2039,7 @@ setup_steam() {
 main() {
     echo -e "${BOLD}"
     echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║       Fedora Forge 全面初始化脚本 v4.0       ║"
+    echo "  ║       Fedora Forge 全面初始化脚本 v4.1       ║"
     echo "  ║            KDE Plasma Edition               ║"
     echo "  ╚══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -1968,7 +2059,7 @@ main() {
     info "将执行以下模块:"
     [[ "$RUN_SOURCE" -eq 1 ]] && echo -e "  ${GREEN}✓${NC} 软件源优化"
     [[ "$RUN_UPGRADE" -eq 1 ]] && echo -e "  ${GREEN}✓${NC} 系统升级检查 ${YELLOW}(全量升级+重启检测)${NC}"
-    [[ "$RUN_GPU" -eq 1 ]]    && echo -e "  ${GREEN}✓${NC} CPU/GPU驱动 + auto-cpufreq + 解码"
+    [[ "$RUN_GPU" -eq 1 ]]    && echo -e "  ${GREEN}✓${NC} CPU/GPU驱动 + 电源方案(默认/auto-cpufreq) + 解码"
     [[ "$RUN_TERM" -eq 1 ]]   && echo -e "  ${GREEN}✓${NC} 终端配置"
     [[ "$RUN_THEME" -eq 1 ]]  && echo -e "  ${GREEN}✓${NC} 主题 & 系统优化 (含 NM 优化)"
     [[ "$RUN_APPS" -eq 1 ]]   && echo -e "  ${GREEN}✓${NC} 应用管理"
