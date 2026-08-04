@@ -447,7 +447,7 @@ Type=Application
 Name=Source Optimize
 Comment=开机自动刷新软件源缓存 (仅首次)
 Exec=${SCRIPTS_DIR}/source-optimize.sh
-Terminal=true
+Terminal=false
 X-KDE-autostart-after=panel
 EOF
     chown -R "$ACTUAL_USER:" "${ACTUAL_HOME}/.config/autostart" 2>/dev/null || true
@@ -621,13 +621,45 @@ REPO
     cat > "${SCRIPTS_DIR}/source-optimize.sh" << 'SRCSCRIPT'
 #!/bin/bash
 # 开机后自动优化软件源 (仅首次运行)
+#  - dnf5 用户级缓存, 无需 sudo/密码
+#  - 网络未就绪时不写 marker, 下次登录自动重试
+#  - 全程日志: ~/.local/scripts/source-optimize.log
 MARKER="$HOME/.local/scripts/.source-optimized"
+LOG="$HOME/.local/scripts/source-optimize.log"
 [[ -f "$MARKER" ]] && exit 0
-echo "[Source Optimize] 正在刷新缓存..."
-sudo dnf makecache 2>/dev/null
-flatpak update -y 2>/dev/null
+
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
+
+# 等待网络就绪 (最多 60s, 每 4s 探测一次; 镜像源可达即视为就绪)
+NET_OK=0
+for _ in $(seq 1 15); do
+    if curl -fs --connect-timeout 3 --max-time 5 https://mirrors.fedoraproject.org >/dev/null 2>&1; then
+        NET_OK=1
+        break
+    fi
+    sleep 4
+done
+if [[ "$NET_OK" -eq 0 ]]; then
+    log "⚠ 网络未就绪, 本次跳过 (不标记, 下次登录自动重试)"
+    exit 0
+fi
+
+log "开始刷新软件源缓存..."
+# dnf5 用户级元数据缓存 (无需 root)
+if timeout 300 dnf makecache >/dev/null 2>&1; then
+    log "✅ dnf makecache 完成"
+else
+    log "⚠ dnf makecache 失败 (可手动: dnf makecache)"
+fi
+# flatpak 用户级更新
+if timeout 600 flatpak update -y >/dev/null 2>&1; then
+    log "✅ flatpak update 完成"
+else
+    log "⚠ flatpak update 失败或无需更新"
+fi
+
 touch "$MARKER"
-echo "[Source Optimize] 完成"
+log "完成 (已标记, 不再重复执行)"
 SRCSCRIPT
     chmod +x "${SCRIPTS_DIR}/source-optimize.sh"
     ensure_source_autostart
