@@ -1,0 +1,18 @@
+patch:
+  # 1. 基础设置
+  ascii_composer/good_old_caps_lock: true
+  "menu/page_size": 10
+
+  # 2. 开启原生全拼提示（纯内建功能）
+  "translator/always_show_comments": true
+  "translator/spelling_hints": 12
+
+  # 3. 格式化为 [全拼] 样式
+  "translator/comment_format":
+    - "xform/^/[/"
+    - "xform/$/]/"
+
+  # 4. 万象语法模型 (librime-octagram): grammar/language 引用即可
+  "grammar/language": wanxiang-lts-zh-hans
+
+  # 5. 候选框翻页: 使用 rime-ice 默认 - (上一页) / = (下一页), 无需额外配置
