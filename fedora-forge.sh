@@ -855,7 +855,7 @@ setup_terminal() {
 
     # ── 2) Zsh + Starship + Zinit (内嵌确定性配置, 不再依赖交互式 Z-SHIFT) ──
     info "部署 Zsh 环境..."
-    dnf_install_quiet zsh eza zoxide fd-find ripgrep bat fzf btop tealdeer wl-clipboard xclip || true
+    dnf_install_quiet zsh eza zoxide fd-find ripgrep bat fzf btop tealdeer wl-clipboard xclip fastfetch || true
     # 幂等: 已是 zsh 登录 shell 则跳过 chsh
     if [[ "$(getent passwd "$ACTUAL_USER" | cut -d: -f7)" != "/usr/bin/zsh" ]]; then
         chsh -s /usr/bin/zsh "$ACTUAL_USER" 2>/dev/null || true
@@ -886,10 +886,20 @@ setup_terminal() {
     fi
 
     # 写入 .zshrc (中文注释, 实用向: 建议/高亮/fzf-tab/zoxide/eza)
-    # 幂等: 已含 Fedora Forge 标记则跳过重写 (避免 mtime 变化触发插件重载)
-    if grep -q "Fedora Forge - Zsh 配置" "$ACTUAL_HOME/.zshrc" 2>/dev/null; then
+    # 幂等: 需同时满足 "Fedora Forge 标记" + "修复版顺序签名" 才跳过重写.
+    #   ⚠ 旧版 v4.0 的 .zshrc 有初始化顺序缺陷: 插件在 compinit 之前加载,
+    #   且 autosuggestions/fast-syntax-highlighting 先于 fzf-tab 包装了 Tab
+    #   相关 widget, 导致 fzf-tab 捕获到失效副本 → Tab 补全完全无响应.
+    #   因此仅凭标记判断幂等不够, 必须校验顺序签名, 旧版配置自动备份重写.
+    if grep -q "Fedora Forge - Zsh 配置" "$ACTUAL_HOME/.zshrc" 2>/dev/null \
+       && grep -q "fzf-tab 最先加载" "$ACTUAL_HOME/.zshrc" 2>/dev/null; then
         info "✅ .zshrc 已配置 (跳过重写)"
     else
+    # 覆盖前备份用户原有配置
+    if [[ -f "$ACTUAL_HOME/.zshrc" ]]; then
+        cp "$ACTUAL_HOME/.zshrc" "$ACTUAL_HOME/.zshrc.fedora-forge.backup.$(date +%s)" 2>/dev/null || true
+        info "已备份原 .zshrc → ~/.zshrc.fedora-forge.backup.*"
+    fi
     cat > "$ACTUAL_HOME/.zshrc" << 'ZSHRC'
 # ==================================================
 # Fedora Forge - Zsh 配置 (MapleMono NF CN)
@@ -904,24 +914,25 @@ setup_terminal() {
 ZINIT_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/zinit/zinit.git"
 [[ -f "$ZINIT_HOME/zinit.zsh" ]] && source "$ZINIT_HOME/zinit.zsh"
 
-# ---- Starship 提示符 ----
-command -v starship >/dev/null 2>&1 && eval "$(starship init zsh)"
+# ---- 自动补全 (必须在插件之前初始化, 否则 Tab 补全失效) ----
+autoload -Uz compinit
+compinit -C -d "${XDG_CACHE_HOME:-$HOME/.cache}/zsh/zcompdump"
 
-# ---- 插件 (顺序: fzf-tab 先加载保留原始 widget 引用, 再加载高亮/建议) ----
+# ---- 插件 (顺序关键: fzf-tab 最先加载, 捕获未被包装的原始 widget) ----
 if command -v zinit >/dev/null 2>&1; then
     zinit light Aloxaf/fzf-tab
-    zinit light zdharma-continuum/fast-syntax-highlighting
     zinit light zsh-users/zsh-autosuggestions
+    zinit light zdharma-continuum/fast-syntax-highlighting
 fi
+
+# ---- Starship 提示符 ----
+command -v starship >/dev/null 2>&1 && eval "$(starship init zsh)"
 
 # ---- 历史记录 ----
 HISTFILE=~/.zsh_history
 HISTSIZE=50000
 SAVEHIST=50000
 setopt SHARE_HISTORY HIST_IGNORE_DUPS HIST_SAVE_NO_DUPS
-
-# ---- 自动补全 ----
-autoload -Uz compinit && compinit -d "${XDG_CACHE_HOME:-$HOME/.cache}/zsh/zcompdump"
 
 # ---- fzf-tab: cd 时用 eza 预览 ----
 zstyle ':fzf-tab:complete:cd:*' fzf-preview 'eza -1 --color=always $realpath'
@@ -949,33 +960,69 @@ alias update='sudo dnf upgrade --refresh'
 alias clean='sudo dnf autoremove'
 alias sz='source ~/.zshrc'
 alias ez='nano ~/.zshrc'
+
+# ---- Yazi 文件管理器 (退出后自动切换目录) ----
+if command -v yazi >/dev/null 2>&1; then
+    alias y='yazi'
+    function yy() {
+        local tmp="$(mktemp -t yazi-cwd.XXXXXX)"
+        yazi "$@" --cwd-file="$tmp"
+        if read -r cwd < "$tmp" && [ -n "$cwd" ] && [ "$cwd" != "$PWD" ]; then
+            builtin cd -- "$cwd"
+        fi
+        rm -f "$tmp"
+    }
+fi
+
+# ---- 登录欢迎信息 (仅交互式终端显示, ssh/脚本调用不显示) ----
+if [[ -o interactive ]]; then
+    command -v fastfetch >/dev/null 2>&1 && fastfetch
+fi
 ZSHRC
     chown "$ACTUAL_USER:" "$ACTUAL_HOME/.zshrc" 2>/dev/null || true
-    info "✅ .zshrc 已写入 (Zinit + Starship + 建议/高亮/fzf-tab)"
+    info "✅ .zshrc 已写入 (compinit→fzf-tab 正确顺序 + fastfetch/Yazi)"
     fi
 
     # fzf-tab 原生模块 (compcap): 缺失时 Tab 补全列表无法正常捕获/展示.
     # 依赖 gcc/make/ncurses-devel, 编译一次后所有 zsh 会话自动加载
     # 需在 .zshrc 写入并首次触发 zinit 拉取插件之后执行
-    if command -v gcc >/dev/null 2>&1; then
-        local FZFTAB_DIR="${ACTUAL_HOME}/.local/share/zinit/plugins/Aloxaf---fzf-tab"
-        # 首次执行: 触发一次 zinit 拉取三个插件 (幂等, 已拉取则秒过)
-        if [[ ! -d "$FZFTAB_DIR" ]]; then
-            info "预热 zinit 插件 (首次拉取 fast-syntax-highlighting/autosuggestions/fzf-tab)..."
-            su - "$ACTUAL_USER" -c "zsh -ic 'zinit light Aloxaf/fzf-tab' >/dev/null 2>&1" || true
-        fi
-        if [[ -d "$FZFTAB_DIR" && ! -f "$FZFTAB_DIR/modules/Src/aloxaf/fzftab.so" ]]; then
-            info "编译 fzf-tab 原生模块 (compcap)..."
-            dnf_install_quiet ncurses-devel || true
-            chown -R "$ACTUAL_USER:" "$FZFTAB_DIR" 2>/dev/null || true
-            if su - "$ACTUAL_USER" -c "cd '${FZFTAB_DIR}' && zsh -fc 'source ./fzf-tab.zsh && build-fzf-tab-module'" >/dev/null 2>&1 \
-               && [[ -f "$FZFTAB_DIR/modules/Src/aloxaf/fzftab.so" ]]; then
-                info "✅ fzf-tab compcap 模块编译完成 (Tab 补全列表将正常显示)"
-            else
-                warn "fzf-tab 模块编译失败, Tab 补全可能异常 (可稍后手动: cd ~/.local/share/zinit/plugins/Aloxaf---fzf-tab && zsh -fc 'source ./fzf-tab.zsh && build-fzf-tab-module')"
-            fi
+    # 失败不中断脚本 (编译工具缺失/网络不稳均只告警, || true 兜底)
+    local FZFTAB_DIR="${ACTUAL_HOME}/.local/share/zinit/plugins/Aloxaf---fzf-tab"
+    # 首次执行: 触发一次 zinit 拉取三个插件 (幂等, 已拉取则秒过)
+    if [[ ! -d "$FZFTAB_DIR" ]]; then
+        info "预热 zinit 插件 (首次拉取 fzf-tab/autosuggestions/fast-syntax-highlighting)..."
+        su - "$ACTUAL_USER" -c "zsh -ic 'zinit self-update >/dev/null 2>&1; zinit light Aloxaf/fzf-tab; zinit light zsh-users/zsh-autosuggestions; zinit light zdharma-continuum/fast-syntax-highlighting' >/dev/null 2>&1" || true
+    fi
+    if [[ -d "$FZFTAB_DIR" && ! -f "$FZFTAB_DIR/modules/Src/aloxaf/fzftab.so" ]]; then
+        info "编译 fzf-tab 原生模块 (compcap)..."
+        dnf_ensure gcc make ncurses-devel || true
+        chown -R "$ACTUAL_USER:" "$FZFTAB_DIR" 2>/dev/null || true
+        if su - "$ACTUAL_USER" -c "cd '${FZFTAB_DIR}' && zsh -fc 'source ./fzf-tab.zsh && build-fzf-tab-module'" >/dev/null 2>&1 \
+           && [[ -f "$FZFTAB_DIR/modules/Src/aloxaf/fzftab.so" ]]; then
+            info "✅ fzf-tab compcap 模块编译完成 (Tab 补全列表将正常显示)"
+        else
+            warn "fzf-tab 模块编译失败, Tab 补全可能异常 (可稍后手动: cd ~/.local/share/zinit/plugins/Aloxaf---fzf-tab && zsh -fc 'source ./fzf-tab.zsh && build-fzf-tab-module')"
         fi
     fi
+
+    # ── Yazi 终端文件管理器 (COPR varlad/yazi, 幂等: 已装/仓库已启用则跳过) ──
+    # Fedora 官方仓库无 yazi, 需启用 COPR; 启用失败/安装失败均不中断脚本
+    info "安装 Yazi 终端文件管理器..."
+    if command -v yazi >/dev/null 2>&1; then
+        info "✅ Yazi 已安装 ($(yazi --version 2>/dev/null | head -1))"
+    else
+        if ! "$DNF" copr list 2>/dev/null | grep -q "varlad/yazi"; then
+            info "启用 COPR 仓库 varlad/yazi..."
+            timeout 120 "$DNF" copr enable -y varlad/yazi >/dev/null 2>&1 || \
+                warn "Yazi COPR 启用失败"
+        fi
+        dnf_install_quiet yazi || warn "Yazi 安装失败"
+    fi
+    # 图片/视频预览依赖 (仓库无此包时 dnf_ensure 自动跳过, 不中断)
+    dnf_ensure ueberzugpp || true
+    # 初始化 Yazi 配置目录 (首次启动由 yazi 自行生成默认配置)
+    mkdir -p "$ACTUAL_HOME/.config/yazi"
+    chown -R "$ACTUAL_USER:" "$ACTUAL_HOME/.config/yazi" 2>/dev/null || true
 
     # starship 配置 (优先使用项目 konsole/starship.toml, 缺失时退回内嵌兜底)
     # 幂等: 已存在则跳过 (内容变更需手动更新)
@@ -1182,6 +1229,45 @@ KITTYFALLBACK
     #   用户 zsh 将无法创建 zinit 插件目录 (实测: 插件加载全线失败).
     #   统一递归修正用户本地目录归属
     chown -R "$ACTUAL_USER:" "$ACTUAL_HOME/.local/bin" "$ACTUAL_HOME/.local/share/zinit" 2>/dev/null || true
+
+    # ── Tab 补全自检: 验证 fzf-tab 绑定与 compinit 就绪 (失败不静默) ──
+    info "自检 Tab 补全..."
+    if su - "$ACTUAL_USER" -c "zsh -ic 'bindkey | command grep -q complete'" >/dev/null 2>&1; then
+        info "✅ zsh 补全绑定正常 (Tab → fzf-tab)"
+    else
+        warn "WARNING: zsh completion initialization failed"
+        warn "请重启终端 (或执行: exec zsh) 后重试; 仍失败请检查 ~/.local/share/zinit 权限与网络"
+    fi
+
+    # ── 终端组件最终验证清单 ──
+    echo ""
+    info "Terminal setup check:"
+    local _tcmd
+    for _tcmd in zsh starship fastfetch fzf yazi; do
+        if command -v "$_tcmd" >/dev/null 2>&1; then
+            echo -e "  ${GREEN}✓${NC} $_tcmd installed"
+        else
+            echo -e "  ${YELLOW}✗${NC} $_tcmd not found"
+        fi
+    done
+    unset _tcmd
+    if command -v zinit >/dev/null 2>&1 || [[ -f "${ACTUAL_HOME}/.local/share/zinit/zinit.git/zinit.zsh" ]]; then
+        echo -e "  ${GREEN}✓${NC} zinit installed"
+    else
+        echo -e "  ${YELLOW}✗${NC} zinit not installed"
+    fi
+    if [[ -d "${ACTUAL_HOME}/.local/share/zinit/plugins/Aloxaf---fzf-tab" ]]; then
+        echo -e "  ${GREEN}✓${NC} fzf-tab installed"
+    else
+        echo -e "  ${YELLOW}✗${NC} fzf-tab not installed"
+    fi
+    if su - "$ACTUAL_USER" -c "zsh -ic 'bindkey | command grep -q complete'" >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${NC} zsh completion enabled"
+    else
+        echo -e "  ${YELLOW}✗${NC} zsh completion disabled"
+    fi
+    echo ""
+    echo -e "  重启终端: ${CYAN}exec zsh${NC} (新终端 Tab 即可使用 fzf 补全, 显示 fastfetch)"
     info "✅ 终端配置完成"
 }
 
@@ -1653,7 +1739,7 @@ REPO
     fi
 
     # ── Telegram / Haruna (dnf) ──
-    dnf_ensure telegram-desktop haruna
+    dnf_ensure telegram-desktop haruna kate
 
     # ── QQ / 微信 / ONLYOFFICE / Gopeed / ReadAny / VutronMusic / zed / MarkShot / ScrcpyGUI (RPM) ──
     install_direct_rpm "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/release/c97651b2/QQ_3.2.32_260730_x86_64_01.rpm" "QQ" "linuxqq"
