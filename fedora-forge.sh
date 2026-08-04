@@ -855,7 +855,7 @@ setup_terminal() {
 
     # ── 2) Zsh + Starship + Zinit (内嵌确定性配置, 不再依赖交互式 Z-SHIFT) ──
     info "部署 Zsh 环境..."
-    dnf_install_quiet zsh eza zoxide fd-find ripgrep bat fzf btop tealdeer wl-clipboard xclip fastfetch || true
+    dnf_install_quiet zsh eza zoxide fd-find ripgrep bat fzf btop tealdeer wl-clipboard xclip fastfetch chafa || true
     # 幂等: 已是 zsh 登录 shell 则跳过 chsh
     if [[ "$(getent passwd "$ACTUAL_USER" | cut -d: -f7)" != "/usr/bin/zsh" ]]; then
         chsh -s /usr/bin/zsh "$ACTUAL_USER" 2>/dev/null || true
@@ -1438,9 +1438,8 @@ LOGIN
     fi
 
     # 连通性检测: 在 /etc/NetworkManager/NetworkManager.conf 追加 [connectivity] 段
-    #   (幂等: 键已存在则跳过; 旧方案 conf.d 独立文件统一移除, 避免双写)
+    #   (幂等: 键已存在则跳过; 仅首次写入时重启 NetworkManager)
     local NM_CONF="/etc/NetworkManager/NetworkManager.conf"
-    rm -f /etc/NetworkManager/conf.d/90-disable-connectivity.conf 2>/dev/null || true
     if grep -q '^enabled=false' "$NM_CONF" 2>/dev/null; then
         info "  - 连通性检测: 已禁用 (跳过)"
     else
