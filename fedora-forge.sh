@@ -435,10 +435,37 @@ system_upgrade_check() {
 }
 
 # ============================================================================
-#  1/7  软件源优化
+#  1/7  软件源优化 (多站并发测速 + RPM Fusion + Flathub + 开机自启)
 # ============================================================================
+
+# 挂载 source-optimize.sh 到 KDE 开机自启 (幂等; 老版本部署过脚本但未挂载, 需补齐)
+ensure_source_autostart() {
+    mkdir -p "${ACTUAL_HOME}/.config/autostart" 2>/dev/null || return 1
+    cat > "${ACTUAL_HOME}/.config/autostart/source-optimize.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Source Optimize
+Comment=开机自动刷新软件源缓存 (仅首次)
+Exec=${SCRIPTS_DIR}/source-optimize.sh
+Terminal=true
+X-KDE-autostart-after=panel
+EOF
+    chown -R "$ACTUAL_USER:" "${ACTUAL_HOME}/.config/autostart" 2>/dev/null || true
+    return 0
+}
+
 optimize_sources() {
     step "1/7 软件源优化"
+
+    # 幂等: 开机源优化脚本已部署 → 完整源优化此前已完成, 跳过重复执行 (避免冗余)
+    #  (source-optimize.sh 仅在完整优化成功后部署, 其存在即代表镜像/仓库已配置好)
+    if [[ -f "${SCRIPTS_DIR}/source-optimize.sh" ]]; then
+        # 老版本可能只部署了脚本但未挂载开机自启, 这里补齐挂载
+        ensure_source_autostart
+        info "✅ 检测到开机源优化脚本已部署, 软件源此前已完成优化, 跳过重复执行"
+        info "    (如需强制重跑: rm -f ${SCRIPTS_DIR}/source-optimize.sh && sudo bash $0 -source)"
+        return 0
+    fi
 
     # 检测包管理器
     info "检测包管理器..."
@@ -603,9 +630,10 @@ touch "$MARKER"
 echo "[Source Optimize] 完成"
 SRCSCRIPT
     chmod +x "${SCRIPTS_DIR}/source-optimize.sh"
+    ensure_source_autostart
     chown -R "$ACTUAL_USER:" "$SCRIPTS_DIR"
 
-    info "✅ 软件源优化完成"
+    info "✅ 软件源优化完成 (开机自启脚本已挂载, 下次登录自动刷新缓存)"
 }
 
 # ============================================================================
