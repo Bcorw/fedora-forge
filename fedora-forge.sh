@@ -855,7 +855,7 @@ setup_terminal() {
 
     # ── 2) Zsh + Starship + Zinit (内嵌确定性配置, 不再依赖交互式 Z-SHIFT) ──
     info "部署 Zsh 环境..."
-    dnf_install_quiet zsh eza zoxide fd-find ripgrep bat fzf btop tealdeer wl-clipboard xclip fastfetch chafa || true
+    dnf_install_quiet zsh eza zoxide fd-find ripgrep bat fzf btop tealdeer wl-clipboard xclip fastfetch || true
     # 幂等: 已是 zsh 登录 shell 则跳过 chsh
     if [[ "$(getent passwd "$ACTUAL_USER" | cut -d: -f7)" != "/usr/bin/zsh" ]]; then
         chsh -s /usr/bin/zsh "$ACTUAL_USER" 2>/dev/null || true
@@ -1085,9 +1085,8 @@ STARSHIP
     #  1) fastfetch ≥2.16 只自动加载 config.jsonc, config.json 会被静默忽略
     #  2) 图片 logo 必须显式 "type" 且 source 指向真实存在的文件,
     #     扩展名必须匹配 (4.jpg 写成 4.png 会静默回退内置 ASCII logo)
-    #  3) 渲染后端: kitty 终端用 "kitty" (原生像素级, 零依赖);
-    #     Konsole 等无图形协议终端需 "chafa" (脚本已安装 chafa 包);
-    #     timg 不是 fastfetch 的渲染后端
+    #  3) 渲染后端: kitty 终端用 "type": "kitty" (原生像素级, 零依赖,
+    #     无需 chafa/timg); Konsole 等无图形协议终端需 chafa
     local FF_DIR="$ACTUAL_HOME/.config/fastfetch"
     local FF_SRC="${RES_DIR}/fastfetch"
     if [[ -d "$FF_SRC" && -f "$FF_SRC/config.jsonc" ]]; then
