@@ -1081,8 +1081,10 @@ STARSHIP
     fi
 
     # ── Fastfetch 配置 (优先使用项目 fastfetch/ 目录部署) ──
-    # ⚠ fastfetch ≥2.16 只自动加载 config.jsonc, config.json 会被静默忽略
-    #   (实测: 直接放 config.json 终端里 fastfetch 仍显示默认 logo)
+    # ⚠ 两点必踩的坑:
+    #  1) fastfetch ≥2.16 只自动加载 config.jsonc, config.json 会被静默忽略
+    #  2) 图片 logo 必须显式 "type": "chafa" 且 source 指向真实存在的文件,
+    #     否则回退内置 ASCII logo (Konsole 不支持 kitty/iTerm 图形协议)
     local FF_DIR="$ACTUAL_HOME/.config/fastfetch"
     local FF_SRC="${RES_DIR}/fastfetch"
     if [[ -d "$FF_SRC" && -f "$FF_SRC/config.jsonc" ]]; then
