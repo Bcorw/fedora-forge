@@ -1081,10 +1081,13 @@ STARSHIP
     fi
 
     # ── Fastfetch 配置 (优先使用项目 fastfetch/ 目录部署) ──
-    # ⚠ 两点必踩的坑:
+    # ⚠ 必踩的坑:
     #  1) fastfetch ≥2.16 只自动加载 config.jsonc, config.json 会被静默忽略
-    #  2) 图片 logo 必须显式 "type": "chafa" 且 source 指向真实存在的文件,
-    #     否则回退内置 ASCII logo (Konsole 不支持 kitty/iTerm 图形协议)
+    #  2) 图片 logo 必须显式 "type" 且 source 指向真实存在的文件,
+    #     扩展名必须匹配 (4.jpg 写成 4.png 会静默回退内置 ASCII logo)
+    #  3) 渲染后端: kitty 终端用 "kitty" (原生像素级, 零依赖);
+    #     Konsole 等无图形协议终端需 "chafa" (脚本已安装 chafa 包);
+    #     timg 不是 fastfetch 的渲染后端
     local FF_DIR="$ACTUAL_HOME/.config/fastfetch"
     local FF_SRC="${RES_DIR}/fastfetch"
     if [[ -d "$FF_SRC" && -f "$FF_SRC/config.jsonc" ]]; then

@@ -1,13 +1,13 @@
 {
   "logo": {
-    "source": "~/.config/fastfetch/png/0.png",
+    "source": "~/.config/fastfetch/png/4.jpg",
     "padding": {
       "top": 4,
       "left": 2,
       "right": 5
     },
     "height": 15,
-    "type": "chafa"
+    "type": "kitty"
   },
   "display": {
     "separator": " "
