@@ -1433,9 +1433,11 @@ KONPROF
              || su - "$ACTUAL_USER" -c "git clone --depth=1 https://gh-proxy.com/https://github.com/Sidharth7082/kitty.git /tmp/kitty-style" >/dev/null 2>&1; } \
            && [[ -f /tmp/kitty-style/kitty/kitty.conf ]]; then
             deploy_kitty_dir "/tmp/kitty-style/kitty" "/tmp/kitty-style/kitty/themes"
+            # 主体配置覆盖为项目定制版 (用户定制优先, GitHub 提供主题库+切换器)
+            [[ -f "${RES_DIR}/kitty.conf" ]] && cp -f "${RES_DIR}/kitty.conf" "$KITTY_CFG_DIR/kitty.conf"
             rm -rf /tmp/kitty-style
             KITTY_OK=1
-            info "✅ Kitty 方案已从 GitHub 克隆部署"
+            info "✅ Kitty 方案已从 GitHub 克隆部署 (主题库+切换器, 配置用项目定制版)"
         fi
         # 离线兜底: 本地项目目录
         if [[ "$KITTY_OK" -eq 0 && -d "$KITTY_SRC" && -f "$KITTY_SRC/kitty.conf" ]]; then
@@ -1445,6 +1447,13 @@ KONPROF
             deploy_kitty_dir "$KITTY_SRC" "$KITTY_THEMES_SRC"
             KITTY_OK=1
             info "✅ Kitty 方案已从本地 kitty/ 部署 (GitHub 不可用)"
+        fi
+        # 定制配置兜底: 项目根 kitty.conf (无主题库时 include 引用会被剥离)
+        if [[ "$KITTY_OK" -eq 0 && -f "${RES_DIR}/kitty.conf" ]]; then
+            mkdir -p "$KITTY_CFG_DIR"
+            cp -f "${RES_DIR}/kitty.conf" "$KITTY_CFG_DIR/kitty.conf"
+            KITTY_OK=1
+            info "✅ Kitty 方案已从项目定制 kitty.conf 部署 (无主题库)"
         fi
         # 最终兜底: 内嵌基础配置
         if [[ "$KITTY_OK" -eq 0 ]]; then
@@ -1461,13 +1470,21 @@ KITTYFALLBACK
         fi
     fi
 
-    # 适配: 字体换为脚本已装的 MapleMono; 背景图路径适配目标用户家目录
-    # (kitty.conf 中写的是固定路径, 换机器运行时按 ACTUAL_HOME 重写;
-    #  背景图文件由用户手动放入 ~/图片/wallpapers/, 脚本不复制)
+    # 适配: 字体换为脚本已装的 MapleMono; 背景图只替换家目录前缀 (保留用户选择的图,
+    #  不再强制覆盖为固定图; 背景图文件由用户手动放入 ~/图片/wallpapers/, 脚本不复制)
     sed -i 's/^font_family.*/font_family Maple Mono NF CN/; s/^font_size.*/font_size 13.0/' \
         "$KITTY_CFG_DIR/kitty.conf" 2>/dev/null
-    sed -i "s|^background_image .*|background_image ${ACTUAL_HOME}/图片/wallpapers/fdg3-wer4.png|" \
+    sed -i -E "s|^background_image /home/[^/]+|background_image ${ACTUAL_HOME}|" \
         "$KITTY_CFG_DIR/kitty.conf" 2>/dev/null
+    # include 的主题文件缺失 (无主题库场景) 时剥离主题块, 避免 kitty 启动报错
+    if [[ -f "$KITTY_CFG_DIR/kitty.conf" ]]; then
+        local INC_THEME
+        INC_THEME=$(grep -oP '^include \K.*' "$KITTY_CFG_DIR/kitty.conf" 2>/dev/null | head -1)
+        if [[ -n "$INC_THEME" && ! -f "$KITTY_CFG_DIR/$INC_THEME" ]]; then
+            sed -i '/^# BEGIN_KITTY_THEME/,/^# END_KITTY_THEME/d' "$KITTY_CFG_DIR/kitty.conf"
+            warn "kitty 主题 $INC_THEME 不存在, 已移除主题引用 (后续安装主题库后重跑恢复)"
+        fi
+    fi
     chown -R "$ACTUAL_USER:" "$KITTY_CFG_DIR" 2>/dev/null || true
     if timeout 10 kitty --config "$KITTY_CFG_DIR/kitty.conf" --version >/dev/null 2>&1; then
         info "✅ Kitty 方案生效 (kitty 配置解析通过, 运行 kitty-theme.sh 可切换 170+ 主题)"
