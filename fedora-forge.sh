@@ -1295,13 +1295,18 @@ setup_terminal() {
     fi
 
     # starship: Fedora 仓库没有, 用官方二进制 (GitHub 直连, 超时保护)
+    # 注意: 不能用 timeout + gh_curl 函数 (timeout 子进程找不到函数), 直接内联
+    #  curl 直连+镜像回退 (实测 bug: timeout 240 gh_curl ... 报 "无法运行命令 gh_curl")
     if [[ ! -x "${ACTUAL_HOME}/.local/bin/starship" ]]; then
         info "安装 starship 提示符..."
         ensure_user_dir "${ACTUAL_HOME}/.local/bin"
         timeout 300 su - "$ACTUAL_USER" -c "curl -fsSL https://starship.rs/install.sh | sh -s -- -y" >/dev/null 2>&1 || \
-        timeout 240 gh_curl "https://github.com/starship/starship/releases/latest/download/starship-x86_64-unknown-linux-gnu.tar.gz" > /tmp/starship.tar.gz \
-            && tar -xzf /tmp/starship.tar.gz -C "${ACTUAL_HOME}/.local/bin" starship \
-            && chmod +x "${ACTUAL_HOME}/.local/bin/starship" 2>/dev/null || true
+        timeout 240 curl -fL --retry 2 "https://github.com/starship/starship/releases/latest/download/starship-x86_64-unknown-linux-gnu.tar.gz" > /tmp/starship.tar.gz 2>/dev/null || \
+        timeout 240 curl -fL --retry 2 "${GHPROXY}https://github.com/starship/starship/releases/latest/download/starship-x86_64-unknown-linux-gnu.tar.gz" > /tmp/starship.tar.gz 2>/dev/null
+        if [[ -s /tmp/starship.tar.gz ]]; then
+            tar -xzf /tmp/starship.tar.gz -C "${ACTUAL_HOME}/.local/bin" starship 2>/dev/null \
+                && chmod +x "${ACTUAL_HOME}/.local/bin/starship" 2>/dev/null || true
+        fi
         rm -f /tmp/starship.tar.gz
         if [[ -x "${ACTUAL_HOME}/.local/bin/starship" ]]; then
             info "✅ starship $("${ACTUAL_HOME}/.local/bin/starship" --version 2>/dev/null)"
