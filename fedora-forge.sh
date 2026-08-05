@@ -8,7 +8,7 @@
 #    2. 系统升级检查 — 仅全量运行(-all/无参数)时执行; 单模块执行自动跳过
 #    3. CPU/GPU驱动  — 自动识别 NVIDIA/AMD/Intel (厂商ID), 安装对应驱动+配套解码
 #                    — NVIDIA 固定生产版 595.80 (open 模块, 默认钉死; FF_NV_VERSION 可换)
-#                    — 电源管理: 默认官方方案; 笔记本询问是否装 auto-cpufreq
+#                    — 电源管理: 台式机/独显本=官方方案; 仅轻薄本询问是否装 auto-cpufreq
 #                    — 装 auto-cpufreq 时生成回退官方方案脚本 (~/.local/scripts/power-official.sh)
 #                    — 音视频解码
 #    4. 终端配置     — 字体 + Zsh/Starship/Zinit + Konsole/Kitty
@@ -114,6 +114,7 @@ for arg in "$@"; do
             echo "  -source   软件源优化"
             echo "  -gpu      CPU/GPU驱动(自动识别, NVIDIA固定595.80) + 电源方案 + 解码"
             echo "            环境变量: FF_NV_VERSION=595.xx 换NVIDIA版本; FF_POWER=auto|default 免交互"
+            echo "            电源: 台式机/独显本自动官方方案; 轻薄本交互询问 auto-cpufreq"
             echo "  -term     终端配置 (字体 + Zsh/Starship/Zinit + Konsole/Kitty)"
             echo "  -theme    主题 & 系统优化 (含 NetworkManager 优化)"
             echo "  -apps     应用管理 (卸载 + 安装)"
@@ -720,16 +721,28 @@ optimize_gpu() {
         systemctl mask "$svc.service" 2>/dev/null || true
     }
 
-    # ── 电源管理方案 (默认官方; 仅笔记本询问是否装 auto-cpufreq) ──
+    # ── 电源管理方案 ──
+    # 三类场景, 差异化策略 (2026-08 实测优化):
+    #   台式机(无电池)      → 官方默认
+    #   独显本/游戏本(有电池+NVIDIA) → 强制官方, 不装 auto-cpufreq
+    #       (auto-cpufreq 会禁用 power-profiles-daemon, 实测导致 EC 性能模式
+    #        功能键失效/功耗链路异常 — 苍龙16 实测)
+    #   轻薄本/核显本(有电池+无独显) → 询问是否尝试 auto-cpufreq
     if [[ "$POWER_MODE" == "ask" ]]; then
         if compgen -G "/sys/class/power_supply/BAT*" >/dev/null 2>&1; then
-            echo ""
-            echo -e "  ${CYAN}电源管理方案${NC} (检测到笔记本, 有电池):"
-            echo "    1) 系统默认 (power-profiles-daemon + amd-pstate EPP)  [官方默认, 回车直接选]"
-            echo "    2) auto-cpufreq (自动调频优化)"
-            read -r -p "  请选择 [1/2]: " POWER_CHOICE
-            POWER_MODE="default"
-            [[ "$POWER_CHOICE" == "2" ]] && POWER_MODE="auto"
+            if [[ "$HAS_NVIDIA" -eq 1 ]]; then
+                info "检测到独显本 (NVIDIA + 电池), 使用官方电源管理 (power-profiles-daemon)"
+                info "  auto-cpufreq 会禁用 power-profiles-daemon, 实测影响 EC 性能模式键/功耗链路, 独显本不推荐安装"
+                POWER_MODE="default"
+            else
+                echo ""
+                echo -e "  ${CYAN}电源管理方案${NC} (检测到轻薄本/核显本, 有电池):"
+                echo "    1) 系统默认 (power-profiles-daemon + amd-pstate EPP)  [官方默认, 回车直接选]"
+                echo "    2) auto-cpufreq (自动调频优化, 轻薄本可尝试)"
+                read -r -p "  请选择 [1/2]: " POWER_CHOICE
+                POWER_MODE="default"
+                [[ "$POWER_CHOICE" == "2" ]] && POWER_MODE="auto"
+            fi
         else
             info "检测到台式机 (无电池), 使用系统默认电源管理 (官方)"
             POWER_MODE="default"
@@ -987,7 +1000,22 @@ EOF
         echo 'force_drivers+=" nvidia nvidia_modeset nvidia_uvm nvidia_drm "' > /etc/dracut.conf.d/90-gpu.conf
         # VA-API 视频硬解桥接
         dnf_install_quiet libva-nvidia-driver vdpauinfo || true
-        info "✅ NVIDIA 配置完成 (modeset=1 + nouveau 黑名单)"
+        # Dynamic Boost 守护进程 (.run 自带 nvidia-powerd, 服务默认 disabled)
+        #  启用后 GPU 功耗墙可随负载动态调整 (配合 EC 性能模式). 注意: Blackwell
+        #  笔记本在 Open 模块 NPCF 绑定缺陷修复前 (issue #1162), nvidia-powerd 可能
+        #  静默运行 — 启用无害, 修复后自动生效, 不要因静默而禁用.
+        if command -v nvidia-powerd >/dev/null 2>&1; then
+            systemctl enable nvidia-powerd >/dev/null 2>&1 || true
+            systemctl start nvidia-powerd >/dev/null 2>&1 || true
+            if systemctl is-active nvidia-powerd >/dev/null 2>&1; then
+                info "✅ nvidia-powerd (Dynamic Boost) 已启用"
+            else
+                info "nvidia-powerd 已安装 (服务未运行; Blackwell 缺陷 #1162 修复前属正常)"
+            fi
+        else
+            info "nvidia-powerd 未随驱动安装 (Dynamic Boost 不可用, 不影响基础功能)"
+        fi
+        info "✅ NVIDIA 配置完成 (modeset=1 + nouveau 黑名单 + nvidia-powerd)"
     fi
 
     # ── AMD: 检测补齐模式 (Fedora 已内置 amdgpu/mesa, 只补缺失的用户空间组件) ──
@@ -1100,10 +1128,41 @@ EOF
         echo "       Kernel driver: ${drv:-未加载}"
     done <<< "$GPU_INFO"
     echo "  ──────────────────────────────────"
+    # 显示输出归属检测: 独显直连 vs 混合模式 (PRIME/Optimus)
+    #  方法: /sys/class/drm/card*-<接口>/status 看哪个 card 有 connected 输出,
+    #  再查该 card 的 PCI vendor (10de=NVIDIA → 独显直连; 否则核显输出=混合模式)
+    local DISPLAY_MODE="未知" NVIDIA_CARD="" CARD_VENDOR=""
+    NVIDIA_CARD=$(ls /sys/class/drm/ 2>/dev/null | grep -oE '^card[0-9]+' | sort -u | while read -r c; do
+        v=$(cat "/sys/class/drm/$c/device/vendor" 2>/dev/null || true)
+        [[ "$v" == "0x10de" ]] && echo "$c" && break
+    done | head -1)
+    if [[ -n "$NVIDIA_CARD" ]]; then
+        # NVIDIA card 上是否有 connected 输出 (独显直连) 还是全靠核显输出 (混合模式)
+        local NV_CONNECTED=0
+        for conn in /sys/class/drm/${NVIDIA_CARD}-*/status; do
+            [[ -f "$conn" ]] || continue
+            [[ "$(cat "$conn" 2>/dev/null)" == "connected" ]] && NV_CONNECTED=1 && break
+        done
+        if [[ "$NV_CONNECTED" -eq 1 ]]; then
+            DISPLAY_MODE="独显直连 (NVIDIA 直接输出显示)"
+        else
+            DISPLAY_MODE="混合模式 (核显输出, NVIDIA 仅渲染/计算)"
+        fi
+    elif [[ "$HAS_NVIDIA" -eq 1 ]]; then
+        DISPLAY_MODE="NVIDIA 未连接显示输出 (检查驱动/线材)"
+    else
+        DISPLAY_MODE="核显输出 (无独显或独显未启用)"
+    fi
+    echo "  显示模式: $DISPLAY_MODE"
+    echo "  ──────────────────────────────────"
     command -v vulkaninfo >/dev/null 2>&1 && echo "  Vulkan: ✓" || echo "  Vulkan: ✗ 缺失"
     command -v vainfo >/dev/null 2>&1 && echo "  VA-API: ✓" || echo "  VA-API: ✗ 缺失"
     rpm -q ffmpeg >/dev/null 2>&1 && echo "  FFmpeg: ✓ (rpmfusion 完整版)" || echo "  FFmpeg: ✗ 缺失"
     echo "  ──────────────────────────────────"
+    # 混合模式提示 (Chromium/Electron 在混合模式 Wayland 下强制走核显, 属正常)
+    if [[ "$DISPLAY_MODE" == *"混合模式"* ]] && command -v google-chrome >/dev/null 2>&1; then
+        info "提示: 混合模式下 Chrome/Electron 会使用核显渲染 (正常行为), 硬解走核显 VA-API"
+    fi
 
     info "✅ GPU + auto-cpufreq + 解码 配置完成"
 }
