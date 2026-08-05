@@ -911,6 +911,20 @@ EOF
         if [[ -n "$NV_VER" && "$NV_VER" == "$NV_TARGET" ]]; then
             info "✅ NVIDIA 驱动已是最新生产版 $NV_VER (跳过安装)"
         else
+            # 询问: 检测到 NVIDIA 但未装官方驱动 — 不自动强装
+            #  (用户可能只用核显/需要 nouveau/Optimus 复杂场景; 跳过: 交互选 2 或 FF_NV_SKIP=1)
+            local NV_SKIP=0
+            if [[ -z "$NV_VER" && "${FF_NV_SKIP:-0}" != "1" ]]; then
+                echo ""
+                echo -e "  ${CYAN}检测到 NVIDIA 独显 (官方驱动未安装)${NC}"
+                echo "    1) 安装官方稳定版 $NV_TARGET (open 内核模块, 生产分支)  [回车默认]"
+                echo "    2) 跳过 (仅用核显 / 开源 nouveau)"
+                read -r -p "  请选择 [1/2]: " NV_CHOICE
+                [[ "$NV_CHOICE" == "2" ]] && NV_SKIP=1
+            fi
+            if [[ "$NV_SKIP" -eq 1 ]]; then
+                info "已跳过 NVIDIA 驱动安装 (核显/nouveau 模式)"
+            else
             if [[ -n "$NV_VER" ]]; then
                 warn "检测到旧驱动 $NV_VER, 先卸载 rpmfusion 包..."
                 "$DNF" remove -y akmod-nvidia xorg-x11-drv-nvidia xorg-x11-drv-nvidia-cuda \
@@ -954,6 +968,7 @@ EOF
                     warn "NVIDIA 安装失败, 可手动执行: sudo sh $NV_RUN --dkms --kernel-module-type=open"
                 fi
             fi
+            fi
         fi
 
         # ── NVIDIA 配置 (幂等, 每次执行) ──
@@ -975,15 +990,34 @@ EOF
         info "✅ NVIDIA 配置完成 (modeset=1 + nouveau 黑名单)"
     fi
 
-    # ── AMD ──
+    # ── AMD: 检测补齐模式 (Fedora 已内置 amdgpu/mesa, 只补缺失的用户空间组件) ──
     if [[ "$HAS_AMD" -eq 1 ]]; then
-        # 幂等: amdgpu 内核模块已加载即视为已装
-        if modinfo -F name amdgpu >/dev/null 2>&1; then
-            info "✅ AMD 核显驱动已就绪: amdgpu (跳过安装)"
+        # 内核驱动: lspci -k 确认已在用 amdgpu (Fedora 默认, 无需安装)
+        local AMD_DRV=""
+        AMD_DRV=$(lspci -k 2>/dev/null | grep -A3 "\[1002:\|\[1022:" | grep -oP 'Kernel driver in use: \K.*' | head -1)
+        if [[ -n "$AMD_DRV" ]]; then
+            info "✅ AMD GPU 内核驱动已就绪: $AMD_DRV (Fedora 内置, 跳过)"
+        elif modinfo -F name amdgpu >/dev/null 2>&1; then
+            info "✅ AMD GPU 内核驱动已就绪: amdgpu (跳过)"
         else
-            info "安装 Mesa + Vulkan..."
-            dnf_install_quiet mesa-dri-drivers mesa-vulkan-drivers mesa-vulkan-drivers.i686 \
-                libva-mesa-driver vulkan-radeon || true
+            info "安装 AMD Mesa 基础驱动..."
+            dnf_install_quiet mesa-dri-drivers || true
+        fi
+
+        # 只补缺失: Vulkan 用户空间 (vulkaninfo 缺失才装)
+        if command -v vulkaninfo >/dev/null 2>&1; then
+            info "✅ Vulkan 已就绪 ($(vulkaninfo --summary 2>/dev/null | grep -oP 'deviceName\s+=\s+\K.*' | head -1 || echo OK))"
+        else
+            info "安装 Vulkan 用户空间 (vulkaninfo 缺失)..."
+            dnf_install_quiet mesa-vulkan-drivers mesa-vulkan-drivers.i686 vulkan-radeon vulkan-tools || true
+        fi
+
+        # 只补缺失: VA-API 硬解 (vainfo 缺失才装; 这是 Fedora 默认可能缺的部分)
+        if command -v vainfo >/dev/null 2>&1; then
+            info "✅ VA-API 已就绪"
+        else
+            info "安装 VA-API 硬解组件 (vainfo 缺失)..."
+            dnf_install_quiet libva libva-utils mesa-va-drivers mesa-vdpau-drivers || true
         fi
 
         if [[ -f /etc/dracut.conf.d/90-gpu.conf ]]; then
@@ -1006,6 +1040,29 @@ EOF
         dnf_install_quiet intel-media-driver || true
     fi
 
+    # ── 硬件服务初始化 (首次启动可靠性) ──
+    # 蓝牙: Fedora 装驱动但不保证服务 enable (204 实测: 首次重启蓝牙不加载,
+    #  手动开启一次后正常 — 典型 service 未 enable 症状, 非驱动问题)
+    info "初始化硬件服务 (蓝牙/udev)..."
+    systemctl daemon-reload 2>/dev/null || true
+    if command -v bluetoothctl >/dev/null 2>&1; then
+        systemctl enable bluetooth.service >/dev/null 2>&1 || true
+        systemctl start bluetooth.service >/dev/null 2>&1 || true
+        if systemctl is-active bluetooth >/dev/null 2>&1; then
+            info "✅ Bluetooth 服务已启用并运行"
+        else
+            warn "Bluetooth 服务未运行 (可手动: systemctl start bluetooth)"
+        fi
+    else
+        info "安装蓝牙组件 (bluez/bluedevil)..."
+        dnf_install_quiet bluez bluez-tools bluedevil || true
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable --now bluetooth.service >/dev/null 2>&1 || true
+    fi
+    # udev 规则重载 (避免首次启动外设/摄像头/输入设备异常)
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger 2>/dev/null || true
+
     # 清理本机用不到的 GPU 专属包 (按检测到的硬件精确清理, 避免误删)
     if [[ "$HAS_NVIDIA" -eq 0 ]]; then
         for pkg in nvidia-gpu-firmware xorg-x11-drv-nvidia-libs; do
@@ -1027,6 +1084,27 @@ EOF
        && [[ "/etc/dracut.conf.d/90-gpu.conf" -nt "/boot/initramfs-$(uname -r).img" ]]; then
         dracut --force 2>/dev/null || true
     fi
+
+    # ── GPU 诊断报告 (不静默, 一眼看清检测/补齐结果) ──
+    echo ""
+    echo -e "  ${CYAN}GPU 检测报告:${NC}"
+    echo "  ──────────────────────────────────"
+    echo "  CPU: $(lscpu 2>/dev/null | grep -m1 'Model name' | sed 's/Model name:[[:space:]]*//')"
+    echo "  ──────────────────────────────────"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local dev_id="" drv=""
+        dev_id=$(echo "$line" | grep -oP '\[\K[0-9a-f]{4}:[0-9a-f]{4}' | head -1 || true)
+        drv=$(lspci -k 2>/dev/null | grep -A3 "\[$dev_id\]" | grep -oP 'Kernel driver in use: \K.*' | head -1 || true)
+        echo "  GPU: $(echo "$line" | sed -E 's/ \[[0-9a-f]{4}:[0-9a-f]{4}\]//')"
+        echo "       Kernel driver: ${drv:-未加载}"
+    done <<< "$GPU_INFO"
+    echo "  ──────────────────────────────────"
+    command -v vulkaninfo >/dev/null 2>&1 && echo "  Vulkan: ✓" || echo "  Vulkan: ✗ 缺失"
+    command -v vainfo >/dev/null 2>&1 && echo "  VA-API: ✓" || echo "  VA-API: ✗ 缺失"
+    rpm -q ffmpeg >/dev/null 2>&1 && echo "  FFmpeg: ✓ (rpmfusion 完整版)" || echo "  FFmpeg: ✗ 缺失"
+    echo "  ──────────────────────────────────"
+
     info "✅ GPU + auto-cpufreq + 解码 配置完成"
 }
 
@@ -1250,8 +1328,8 @@ ZSHRC
         fi
         dnf_install_quiet yazi || warn "Yazi 安装失败"
     fi
-    # Yazi 图片预览依赖 (ueberzugpp): 可选, 非必需 — 官方仓库无包且需 COPR,
-    # 需要时用户可自行安装: sudo dnf copr enable jstkdng/ueberzugpp && sudo dnf install ueberzugpp
+    # Yazi 预览依赖 (原生支持, 替代 ueberzugpp — Fedora 仓库无此包且 COPR 生命周期不可靠)
+    dnf_install_quiet chafa ffmpegthumbnailer poppler-utils mediainfo || true
     # 初始化 Yazi 配置目录 (首次启动由 yazi 自行生成默认配置)
     ensure_user_dir "$ACTUAL_HOME/.config/yazi"
 
