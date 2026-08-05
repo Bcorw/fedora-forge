@@ -6,6 +6,8 @@
 #  模块:
 #    1. 软件源优化   — 多站并发测速 + RPM Fusion + Flathub + 开机自启
 #    2. 系统升级检查 — 仅全量运行(-all/无参数)时执行; 单模块执行自动跳过
+#                    — 用 dnf5 离线升级(与 Discover 一致): 下载→重启→启动早期一次性应用
+#                    — 不用在线 dnf upgrade (KDE 运行中装包会并发写坏配置, 且新旧库混合)
 #    3. CPU/GPU驱动  — 自动识别 NVIDIA/AMD/Intel (厂商ID), 安装对应驱动+配套解码
 #                    — NVIDIA 固定生产版 595.80 (open 模块, 默认钉死; FF_NV_VERSION 可换)
 #                    — 电源管理: 台式机/独显本=官方方案; 仅轻薄本询问是否装 auto-cpufreq
@@ -425,12 +427,36 @@ system_upgrade_check() {
     fi
 
     # 2) 全量升级 (默认执行, --no-upgrade 跳过)
+    #    用 dnf5 离线升级机制 (与 KDE Discover 行为一致):
+    #    download 阶段只下载并暂存事务, 重启后由 systemd 在启动早期一次性应用
+    #    全部更新 — 所有包(内核/库/驱动)原子切换, 不存在"内核已换库还旧"的
+    #    中间态, 也不会在 KDE 运行中并发写配置 (204 实测 autoBrightnessCurve
+    #    全零损坏即在线升级时 KWin 运行中写坏; 2026-08 优化)
     if [[ "$RUN_UPGRADE" -eq 1 ]]; then
-        info "执行全量系统升级 (首次运行需较长时间, 请保持网络稳定)..."
-        if timeout 5400 "$DNF" upgrade --refresh -y >/dev/null 2>&1; then
-            info "✅ 系统升级完成"
+        # 检测当前是否有未应用的离线事务 (上次 download 后未重启)
+        if "$DNF" offline-upgrade status 2>/dev/null | grep -q "Transaction"; then
+            info "检测到已下载的离线升级事务未应用, 请重启完成升级:"
+            info "  sudo reboot"
+            info "(重启后系统会自动安装更新, 然后再运行 $0 完成剩余模块)"
+            exit 0
+        fi
+        info "执行离线系统升级 (下载更新, 重启后自动安装 — 与 Discover 一致)..."
+        # 检查是否有可用更新 (无更新时 offline-upgrade download 会报错)
+        if ! "$DNF" check-update --refresh >/dev/null 2>&1; then
+            info "✅ 系统已是最新, 无需升级"
+        elif timeout 5400 "$DNF" offline-upgrade download >/dev/null 2>&1; then
+            info "✅ 离线升级事务已下载并暂存"
+            if "$DNF" offline-upgrade status 2>/dev/null | grep -q "Transaction"; then
+                info "检测到待应用更新 (含可能的新内核), 请重启完成升级:"
+                info "  sudo reboot"
+                info "(重启后系统自动安装全部更新, 然后再次运行 $0 完成剩余模块)"
+                info "提示: 升级应用后旧内核保留, 可随时回退 (grubby --set-default)"
+                exit 0
+            else
+                info "✅ 无待应用更新"
+            fi
         else
-            warn "系统升级失败/超时, 继续执行 (驱动安装可能异常)"
+            warn "离线升级下载失败/超时, 继续执行 (可用 Discover 或 dnf offline-upgrade download 手动升级)"
         fi
     else
         info "已跳过系统升级 (--no-upgrade)"
