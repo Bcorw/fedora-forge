@@ -1074,6 +1074,29 @@ EOF
             dnf_install_quiet libva libva-utils mesa-va-drivers mesa-vdpau-drivers || true
         fi
 
+        # ── 亮度 100% 反而变暗修复 (2026-08 联想 780M 实测) ──
+        # 根因: 内核 7.x amdgpu 新特性 "custom brightness curve" (从面板固件读亮度
+        #       曲线做非线性映射), 部分面板 (如 CSOT T3) 曲线在 100% 处映射异常,
+        #       导致 100% 亮度反而比 98% 暗.
+        # 修复: 内核参数 amdgpu.dcdebugmask=0x40000 (DC_DISABLE_CUSTOM_BRIGHTNESS_CURVE,
+        #       枚举值实查自 amd_shared.h). 幂等: 已设置则跳过.
+        local HAS_CURVE_BUG=0
+        if ls /sys/class/backlight/amdgpu_bl* >/dev/null 2>&1 \
+           && dmesg 2>/dev/null | grep -q "Using custom brightness curve"; then
+            HAS_CURVE_BUG=1
+        fi
+        if [[ "$HAS_CURVE_BUG" -eq 1 ]]; then
+            local DC_MASK="$(cat /sys/module/amdgpu/parameters/dcdebugmask 2>/dev/null || echo 0)"
+            if [[ "$DC_MASK" != "0" && "$DC_MASK" != "0x0" && "$DC_MASK" != "0x00000" ]]; then
+                info "✅ amdgpu dcdebugmask 已设置 ($DC_MASK), 跳过"
+            else
+                info "⚠ 检测到 amdgpu custom brightness curve (100% 亮度可能变暗)"
+                info "  添加内核参数 amdgpu.dcdebugmask=0x40000 (禁用曲线, 需重启生效)..."
+                grubby --update-kernel=ALL --args="amdgpu.dcdebugmask=0x40000" 2>/dev/null || true
+                info "  已添加 (重启后验证: cat /sys/module/amdgpu/parameters/dcdebugmask)"
+            fi
+        fi
+
         if [[ -f /etc/dracut.conf.d/90-gpu.conf ]]; then
             sed -i 's/= " nvidia nvidia_modeset/= " nvidia nvidia_modeset amdgpu/' /etc/dracut.conf.d/90-gpu.conf
         else
