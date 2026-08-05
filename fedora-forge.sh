@@ -763,7 +763,7 @@ optimize_gpu() {
             else
                 echo ""
                 echo -e "  ${CYAN}电源管理方案${NC} (检测到轻薄本/核显本, 有电池):"
-                echo "    1) 系统默认 (power-profiles-daemon + amd-pstate EPP)  [官方默认, 回车直接选]"
+                echo "    1) 系统默认 (tuned 或 power-profiles-daemon, 按已装为准)  [官方默认, 回车直接选]"
                 echo "    2) auto-cpufreq (自动调频优化, 轻薄本可尝试)"
                 read -r -p "  请选择 [1/2]: " POWER_CHOICE
                 POWER_MODE="default"
@@ -776,17 +776,29 @@ optimize_gpu() {
     fi
 
     if [[ "$POWER_MODE" == "default" ]]; then
-        info "电源方案: 系统默认 (power-profiles-daemon + amd-pstate EPP)"
-        systemctl unmask power-profiles-daemon 2>/dev/null || true
-        systemctl enable --now power-profiles-daemon 2>/dev/null || true
-        systemctl enable tuned 2>/dev/null || true
+        # Fedora 44 全新安装默认电源管理是 tuned (balanced-battery profile),
+        # power-profiles-daemon 是可选包. 智能选择:
+        #   PPD 已安装 → 启用 PPD (官方推荐, KDE 电源滑块用)
+        #   PPD 未安装 → 保留 tuned (Fedora 默认, 已在跑则不动)
+        if rpm -q power-profiles-daemon >/dev/null 2>&1; then
+            info "电源方案: 系统默认 (power-profiles-daemon + amd-pstate EPP)"
+            systemctl unmask power-profiles-daemon 2>/dev/null || true
+            systemctl enable --now power-profiles-daemon 2>/dev/null || true
+            systemctl enable tuned 2>/dev/null || true
+            info "日常切换: powerprofilesctl set power-saver|balanced|performance"
+        else
+            info "电源方案: Fedora 默认 (tuned, balanced-battery profile)"
+            info "  power-profiles-daemon 未安装, 保留 tuned 电源管理 (KDE 亮度/电源正常)"
+            systemctl enable --now tuned 2>/dev/null || true
+            tuned-adm active 2>/dev/null || true
+            info "如需 PPD (powerprofilesctl 命令): sudo dnf install power-profiles-daemon && sudo systemctl enable --now power-profiles-daemon"
+        fi
         # AMD 硬件协调电源管理 (Zen4+/9955HX)
         if [[ -d /sys/devices/system/cpu/amd_pstate ]] \
            && [[ "$(cat /sys/devices/system/cpu/amd_pstate/status 2>/dev/null)" != "active" ]]; then
             grubby --update-kernel=ALL --args="amd_pstate=active" 2>/dev/null || true
             info "已添加内核参数 amd_pstate=active (重启后生效)"
         fi
-        info "日常切换: powerprofilesctl set power-saver|balanced|performance"
     else
         info "电源方案: auto-cpufreq (禁用系统默认电源服务)"
         # power-profiles-daemon (与 auto-cpufreq 冲突)
@@ -874,18 +886,23 @@ EOF
                 if [[ -d "${ACTUAL_HOME}/.local/scripts" ]]; then
                     cat > "${ACTUAL_HOME}/.local/scripts/power-official.sh" <<'EOF'
 #!/bin/bash
-# 回退到系统官方电源管理 (停用 auto-cpufreq, 恢复 power-profiles-daemon + tuned)
+# 回退到系统官方电源管理 (停用 auto-cpufreq, 恢复 PPD 或 tuned)
 set -e
 echo "==> 停用 auto-cpufreq 服务..."
 sudo systemctl stop auto-cpufreq 2>/dev/null || true
 sudo systemctl disable auto-cpufreq 2>/dev/null || true
 sudo systemctl mask auto-cpufreq 2>/dev/null || true
-echo "==> 恢复官方电源服务 (power-profiles-daemon + tuned)..."
-sudo systemctl unmask power-profiles-daemon 2>/dev/null || true
-sudo systemctl enable --now power-profiles-daemon 2>/dev/null || true
+echo "==> 恢复官方电源服务..."
+# PPD 装了则启用 (KDE 电源滑块用); 否则保留 tuned (Fedora 44 默认)
 sudo systemctl unmask tuned 2>/dev/null || true
 sudo systemctl enable --now tuned 2>/dev/null || true
-echo "==> 完成! 当前为官方电源方案 (powerprofilesctl status 查看)"
+if rpm -q power-profiles-daemon >/dev/null 2>&1; then
+    sudo systemctl unmask power-profiles-daemon 2>/dev/null || true
+    sudo systemctl enable --now power-profiles-daemon 2>/dev/null || true
+    echo "==> 完成! 当前为官方电源方案 (powerprofilesctl status 查看)"
+else
+    echo "==> 完成! 当前为官方电源方案 (tuned: $(tuned-adm active 2>/dev/null || echo running))"
+fi
 EOF
                     chmod +x "${ACTUAL_HOME}/.local/scripts/power-official.sh"
                     chown "$ACTUAL_USER" "${ACTUAL_HOME}/.local/scripts/power-official.sh" 2>/dev/null || true
