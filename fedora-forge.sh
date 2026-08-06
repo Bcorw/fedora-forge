@@ -114,7 +114,7 @@ for arg in "$@"; do
             echo ""
             echo "模块 (可组合, 无参数=执行 1-6 核心模块):"
             echo "  -source   软件源优化"
-            echo "  -gpu      CPU/GPU驱动(自动识别, NVIDIA生产分支595.58.03) + 电源方案 + 解码"
+            echo "  -gpu      CPU/GPU驱动(自动识别, NVIDIA二选一: 1生产稳定595[默认] 2最新610) + 电源 + 解码"
             echo "            环境变量: FF_NV_VERSION=595.xx 换NVIDIA版本; FF_POWER=auto|default 免交互"
             echo "            电源: 台式机/独显本自动官方方案; 轻薄本交互询问 auto-cpufreq"
             echo "  -term     终端配置 (字体 + Zsh/Starship/Zinit + Konsole/Kitty)"
@@ -712,6 +712,223 @@ SRCSCRIPT
 }
 
 # ============================================================================
+#  NVIDIA of_gpio 补丁应用 (内核 6.12+ 编译修复, 121 2026-08 实测)
+# ============================================================================
+# 内核 6.12+ 移除了 <linux/of_gpio.h> 和 of_get_named_gpio() (仅 Tegra MIPI DSI
+#  面板用, x86 永不执行), rpmfusion 595.58.03 无条件 include → akmods 编译报
+#  "fatal error: linux/of_gpio.h: No such file or directory".
+# 本函数: 从 kmodsrc 源码 tar 打补丁 → 重打包 src.rpm → 替换 /usr/src/akmods/.
+# 补丁文件在项目 patches/nvidia-of_gpio-fix.patch (已对真实源码验证可干净应用).
+apply_nvidia_ofgpio_patch() {
+    local NVSRC_DIR NV_VER_SRC KMOD_SRC KMOD_SRC_RPM
+    NV_VER_SRC=$(rpm -q xorg-x11-drv-nvidia-kmodsrc --qf '%{version}' 2>/dev/null || echo 0)
+    KMOD_SRC="/usr/share/nvidia-kmod-${NV_VER_SRC}/nvidia-kmod-${NV_VER_SRC}-x86_64.tar.xz"
+    local PATCH_FILE="${RES_DIR}/patches/nvidia-of_gpio-fix.patch"
+
+    [[ -f "$KMOD_SRC" ]] || { warn "kmodsrc 源码未找到: $KMOD_SRC (跳过补丁, 编译可能失败)"; return 1; }
+    [[ -f "$PATCH_FILE" ]] || { warn "补丁文件未找到: $PATCH_FILE (跳过补丁, 编译可能失败)"; return 1; }
+
+    info "应用 of_gpio 补丁 (内核 6.12+ 移除 of_gpio.h, 595.58.03 需此修复才能编译)..."
+    local WORK="/tmp/nvidia-ofgpio-fix"
+    rm -rf "$WORK" && mkdir -p "$WORK/kernel"
+    tar xf "$KMOD_SRC" -C "$WORK/kernel" 2>/dev/null || { warn "kmodsrc 解包失败"; return 1; }
+
+    # 打补丁 (两个变体: kernel + kernel-open)
+    if ( cd "$WORK/kernel" && patch -p1 -s < "$PATCH_FILE" ); then
+        info "✅ 补丁应用成功"
+    else
+        # 可能已打过 (幂等) — 检查守卫是否已存在
+        if grep -q "LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)" "$WORK/kernel/kernel-open/common/inc/nv-linux.h" 2>/dev/null; then
+            info "✅ of_gpio 补丁已存在 (幂等跳过)"
+        else
+            warn "of_gpio 补丁应用失败, 编译可能失败 (可手动: cd $WORK/kernel && patch -p1 < $PATCH_FILE)"
+            return 1
+        fi
+    fi
+
+    # 重打包 tar (akmods 从 tar 构建 src.rpm)
+    local TAR_OUT="/tmp/nvidia-kmod-${NV_VER_SRC}-x86_64.tar.xz"
+    rm -f "$TAR_OUT"
+    ( cd "$WORK/kernel" && tar cJf "$TAR_OUT" kernel kernel-open supported-gpus 2>/dev/null ) \
+        || { warn "重打包失败"; return 1; }
+
+    # 重新构建 src.rpm 并替换 akmods 用的源 (rpmfusion 的 akmods 用 .latest 指针对应 src.rpm)
+    # 方案: 直接替换 kmodsrc 包内的 tar (akmodsbuild 从它生成 src.rpm)
+    if cp "$TAR_OUT" "$KMOD_SRC" 2>/dev/null; then
+        chmod 644 "$KMOD_SRC" 2>/dev/null || true
+        info "✅ 已替换 ${KMOD_SRC} (打补丁版)"
+        return 0
+    else
+        warn "替换 kmodsrc 失败 (可手动: sudo cp $TAR_OUT $KMOD_SRC)"
+        return 1
+    fi
+}
+
+# ============================================================================
+#  NVIDIA 方案 A: 生产稳定 595 分支 (dnf5 在线, 默认)
+# ============================================================================
+# 121 2026-08 实测定稿链路:
+#  1. 装编译环境 akmods dkms kernel-devel (必须与运行内核同版本)
+#  2. --disablerepo=rpmfusion-nonfree-updates 防依赖解析升级到 610 (色斑分支)
+#  3. akmod-nvidia + xorg-x11-drv-nvidia 全套 595.58.03
+#  4. 打 of_gpio 补丁 → akmods --force 编译 (内核 6.12+ 移除 of_gpio.h)
+#  5. xorg-x11-drv-nvidia-power + nvidia-powerd/persistenced (65W→140W 功耗解锁)
+#  6. dnf versionlock 锁 nvidia 包防升级回 610
+install_nvidia_595() {
+    local NV_TARGET="${FF_NV_VERSION:-595.58.03}"
+    info "方案 A: 生产稳定 595 分支 — dnf5 安装 rpmfusion $NV_TARGET (open 模块)..."
+
+    # 1. 编译环境
+    info "安装编译环境 (akmods dkms kernel-devel)..."
+    dnf_ensure akmods dkms 2>/dev/null || true
+    local KVER KDEV
+    KVER=$(uname -r)
+    KDEV=$(rpm -q kernel-devel 2>/dev/null || true)
+    if [[ -z "$KDEV" || "$KDEV" != *"$KVER"* ]]; then
+        info "安装 kernel-devel-$KVER (akmods 编译必需, 必须与运行内核同版本)..."
+        "$DNF" install -y "kernel-devel-$KVER" >/dev/null 2>&1 \
+            || warn "kernel-devel-$KVER 安装失败, 编译将无法进行"
+    fi
+
+    # 2+3. 安装 595.58.03 全套 (防 610)
+    info "安装 nvidia 595 全套 (--disablerepo 防依赖升级到 610)..."
+    "$DNF" install -y --disablerepo=rpmfusion-nonfree-updates \
+        "akmod-nvidia-3:${NV_TARGET}" \
+        "xorg-x11-drv-nvidia-3:${NV_TARGET}" \
+        "xorg-x11-drv-nvidia-cuda-3:${NV_TARGET}" \
+        nvidia-settings nvidia-modprobe nvidia-persistenced nvidia-xconfig >/dev/null 2>&1 \
+        || { warn "nvidia 595 安装失败 (检查仓库/网络)"; return 1; }
+
+    # 4. of_gpio 补丁 + 编译 (内核 6.12+ 需要)
+    apply_nvidia_ofgpio_patch
+    # Secure Boot 检测 (官方 DKMS 模块未签名无法加载) — 给出完整方案, 不只警告
+    if command -v mokutil >/dev/null 2>&1 \
+       && [[ "$(mokutil --sb-state 2>/dev/null)" == *"enabled"* ]]; then
+        warn "⚠ 检测到 Secure Boot 已启用!"
+        warn "  NVIDIA 官方驱动 DKMS 模块需签名才能加载, 二选一:"
+        warn "  A) BIOS 关闭 Secure Boot (推荐, 最简单)"
+        warn "  B) 保留 Secure Boot, 导入 DKMS 自签密钥:"
+        warn "     1) 编译完成后执行: sudo mokutil --import /var/lib/dkms/mok.pub"
+        warn "     2) 按提示设置一个临时密码 (如 1234)"
+        warn "     3) 重启进入蓝屏 MOK 管理: Enroll MOK → Continue → Yes → 输入密码"
+        warn "     4) 再重启即可加载模块 (验证: modinfo -F version nvidia)"
+    fi
+    info "akmods --force 编译内核模块 (约 3-10 分钟)..."
+    if akmods --force 2>&1 | tail -5; then
+        info "✅ akmods 编译完成"
+    else
+        warn "akmods 编译失败, 查看: ls /var/cache/akmods/nvidia*/*.failed.log"
+    fi
+
+    # 5. power 包 + 双服务 (65W→140W 功耗解锁, 121 实测关键)
+    info "安装 nvidia-power (Dynamic Boost) + 启用守护进程..."
+    "$DNF" install -y --disablerepo=rpmfusion-nonfree-updates \
+        "xorg-x11-drv-nvidia-power-3:${NV_TARGET}" >/dev/null 2>&1 \
+        || warn "xorg-x11-drv-nvidia-power 安装失败 (功耗可能锁 65W)"
+    systemctl enable --now nvidia-powerd >/dev/null 2>&1 || true
+    systemctl enable --now nvidia-persistenced >/dev/null 2>&1 || true
+    info "✅ nvidia-powerd + nvidia-persistenced 已启用 (重启后 nvidia-smi 应显示 140W 上限)"
+
+    # 6. versionlock 防升级回 610
+    if command -v dnf versionlock >/dev/null 2>&1 || dnf versionlock --help >/dev/null 2>&1; then
+        dnf versionlock add akmod-nvidia kmod-nvidia xorg-x11-drv-nvidia \
+            xorg-x11-drv-nvidia-cuda xorg-x11-drv-nvidia-power \
+            nvidia-settings nvidia-modprobe nvidia-persistenced nvidia-xconfig >/dev/null 2>&1 \
+            && info "✅ dnf versionlock 已锁 nvidia 包 (防升级回 610)"
+    fi
+}
+
+# ============================================================================
+#  NVIDIA 方案 B: 最新特性 610 分支 (dnf5 在线, 追新)
+# ============================================================================
+# 610 = 新特性分支(测试性质): 显示管线回归多 (color_pipeline 色斑/内屏黑屏/
+#  atomic commit 失败, 用户 121 多发行版实测). 选择即接受风险.
+# 优点: 无需 of_gpio 补丁 (已适配新内核), 无需 versionlock (保持最新),
+#  闭源 akmod-nvidia 610 可直接编译.
+install_nvidia_610() {
+    info "方案 B: 最新特性 610 分支 — dnf5 安装 rpmfusion 610 (闭源/最新)..."
+    warn "⚠ 610 为新特性分支(测试性质)! 已知 bug: 随机红色色斑/内屏黑屏/atomic commit 失败"
+    warn "  用户 121 在多发行版实测过 610 色斑问题. 生产力/稳定优先建议用方案 A (595)"
+
+    # 编译环境 (610 同样需要 kernel-devel)
+    dnf_ensure akmods dkms 2>/dev/null || true
+    local KVER KDEV
+    KVER=$(uname -r)
+    KDEV=$(rpm -q kernel-devel 2>/dev/null || true)
+    if [[ -z "$KDEV" || "$KDEV" != *"$KVER"* ]]; then
+        info "安装 kernel-devel-$KVER ..."
+        "$DNF" install -y "kernel-devel-$KVER" >/dev/null 2>&1 \
+            || warn "kernel-devel-$KVER 安装失败"
+    fi
+
+    # 安装 610 最新 (不加 --disablerepo, 从 updates 仓库解析最新 610)
+    info "安装 nvidia 610 最新版 (akmod-nvidia 闭源 + 用户空间)..."
+    "$DNF" install -y akmod-nvidia xorg-x11-drv-nvidia xorg-x11-drv-nvidia-cuda \
+        nvidia-settings nvidia-modprobe nvidia-persistenced nvidia-xconfig >/dev/null 2>&1 \
+        || { warn "nvidia 610 安装失败 (检查仓库/网络)"; return 1; }
+
+    # 610 已适配新内核, 直接编译 (无需补丁)
+    if command -v mokutil >/dev/null 2>&1 \
+       && [[ "$(mokutil --sb-state 2>/dev/null)" == *"enabled"* ]]; then
+        warn "⚠ 检测到 Secure Boot 已启用! DKMS 模块需签名才能加载:"
+        warn "  A) BIOS 关闭 Secure Boot (推荐) / B) mokutil --import /var/lib/dkms/mok.pub + 重启 Enroll MOK"
+    fi
+    info "akmods --force 编译内核模块 (约 3-10 分钟)..."
+    if akmods --force 2>&1 | tail -5; then
+        info "✅ akmods 编译完成"
+    else
+        warn "akmods 编译失败, 查看: ls /var/cache/akmods/nvidia*/*.failed.log"
+    fi
+
+    # power 包 + 双服务 (功耗解锁同样适用)
+    "$DNF" install -y xorg-x11-drv-nvidia-power >/dev/null 2>&1 \
+        || warn "xorg-x11-drv-nvidia-power 安装失败 (功耗可能锁 65W)"
+    systemctl enable --now nvidia-powerd >/dev/null 2>&1 || true
+    systemctl enable --now nvidia-persistenced >/dev/null 2>&1 || true
+    info "✅ nvidia-powerd + nvidia-persistenced 已启用"
+}
+
+# ============================================================================
+#  NVIDIA 方案 B 备选: 官方 .run 安装 595.91.07 (open 模块, 生产分支最新)
+# ============================================================================
+install_nvidia_run() {
+    local NV_TARGET="${FF_NV_VERSION:-595.91.07}"
+    info "备选: 官方 .run 安装 $NV_TARGET (open 模块, 生产分支最新)..."
+
+    local NV_URL="${NV_TARGET}/NVIDIA-Linux-x86_64-${NV_TARGET}.run"
+    local NV_RUN="/opt/nvidia/NVIDIA-Linux-x86_64-${NV_TARGET}.run"
+    mkdir -p /opt/nvidia
+
+    # 下载 + sha256 校验
+    if [[ ! -f "$NV_RUN" ]]; then
+        info "下载 NVIDIA $NV_TARGET (官方生产分支, ~400MB)..."
+        curl -fL --retry 3 -o "$NV_RUN" "https://download.nvidia.com/XFree86/Linux-x86_64/${NV_URL}" \
+            || warn "驱动下载失败 (可稍后手动下载)"
+    fi
+    if [[ -f "$NV_RUN" ]]; then
+        local NV_SHA=""
+        NV_SHA=$(curl -fs --max-time 20 "https://download.nvidia.com/XFree86/Linux-x86_64/${NV_TARGET}/NVIDIA-Linux-x86_64-${NV_TARGET}.run.sha256sum" 2>/dev/null | awk '{print $1}' || true)
+        if [[ -n "$NV_SHA" ]] && ! echo "$NV_SHA  $NV_RUN" | sha256sum -c - >/dev/null 2>&1; then
+            warn "⚠ 驱动校验失败, 删除后重新下载"
+            rm -f "$NV_RUN"
+        else
+            info "✅ 驱动文件校验通过"
+        fi
+    fi
+
+    if [[ -f "$NV_RUN" ]]; then
+        # 内核 6.12+ 适配: 595.91.07 已内置 of_gpio compat (官方修复), 无需补丁
+        # --no-x-check: 跳过 X server 检测 (图形会话下 .run 默认 Abort, 121 两次实测失败)
+        info "安装 NVIDIA $NV_TARGET (open 模块 + DKMS + no-x-check)..."
+        if sh "$NV_RUN" --silent --dkms --kernel-module-type=open --no-x-check; then
+            info "✅ NVIDIA $NV_TARGET (open 模块) 安装成功"
+        else
+            warn "NVIDIA 安装失败, 可手动执行: sudo sh $NV_RUN --dkms --kernel-module-type=open (建议切 tty 或加 --no-x-check)"
+        fi
+    fi
+}
+
+# ============================================================================
 #  3/7  CPU/GPU驱动 + 电源方案(默认/auto-cpufreq) + 音视频解码
 # ============================================================================
 optimize_gpu() {
@@ -848,6 +1065,9 @@ optimize_gpu() {
         # 幂等: venv 与命令已就绪时跳过 venv 创建/pip 安装 (避免每次重复构建)
         if [[ ! -x "$VENV/bin/auto-cpufreq" ]]; then
             info "创建虚拟环境并安装 auto-cpufreq (非交互式, 使用 TUNA PyPI 镜像)..."
+            # venv 依赖: Fedora 的 python3 -m venv 需要 python3-venv 包, 缺失时 venv 创建
+            #  静默失败 (stderr 被吞) → pip 全部失败且日志无真因, 先确保依赖
+            dnf_ensure python3-venv 2>/dev/null || true
             # 国内网络加速: pip 走清华镜像
             export PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
             python3 -m venv --system-site-packages "$VENV" 2>/dev/null
@@ -992,70 +1212,60 @@ EOF
         #   121 2026-08 实测该 bug 会毁掉已配好的 dnf 版)
         if [[ -n "$NV_VER" && "$NV_VER" == 595.* ]]; then
             info "✅ NVIDIA 驱动已装 (生产分支 $NV_VER, open 模块), 跳过安装"
-        else
-            # 询问: 检测到 NVIDIA 但未装官方驱动 — 不自动强装
-            #  (用户可能只用核显/需要 nouveau/Optimus 复杂场景; 跳过: 交互选 2 或 FF_NV_SKIP=1)
+        elif [[ -n "$NV_VER" && "$NV_VER" == 610.* ]]; then
+            # 已装 610 (可能之前手动装的) — 询问是否降级 595 或保留
+            info "检测到已装 610 分支驱动 ($NV_VER)"
             local NV_SKIP=0
-            if [[ -z "$NV_VER" && "${FF_NV_SKIP:-0}" != "1" ]]; then
+            if [[ "${FF_NV_SKIP:-0}" != "1" ]]; then
                 echo ""
-                echo -e "  ${CYAN}检测到 NVIDIA 独显 (官方驱动未安装)${NC}"
-                echo "    1) 安装官方稳定版 $NV_TARGET (open 内核模块, 生产分支)  [回车默认]"
-                echo "    2) 跳过 (仅用核显 / 开源 nouveau)"
+                echo -e "  ${CYAN}检测到 NVIDIA 610 分支驱动 (新特性分支, 有色斑风险)${NC}"
+                echo "    1) 卸载 610, 改装生产稳定 595  [推荐, 回车默认]"
+                echo "    2) 保留 610 不动"
                 read -r -p "  请选择 [1/2]: " NV_CHOICE
                 [[ "$NV_CHOICE" == "2" ]] && NV_SKIP=1
             fi
             if [[ "$NV_SKIP" -eq 1 ]]; then
-                info "已跳过 NVIDIA 驱动安装 (核显/nouveau 模式)"
+                info "保留 610 驱动 (注意色斑风险)"
             else
-            if [[ -n "$NV_VER" ]]; then
-                warn "检测到旧驱动 $NV_VER, 先卸载 rpmfusion 包..."
+                warn "卸载 610 分支驱动..."
                 "$DNF" remove -y akmod-nvidia xorg-x11-drv-nvidia xorg-x11-drv-nvidia-cuda \
                     xorg-x11-drv-nvidia-cuda-libs xorg-x11-drv-nvidia-libs \
                     xorg-x11-drv-nvidia-power nvidia-settings kmod-nvidia \
                     nvidia-modprobe nvidia-persistenced libva-nvidia-driver 2>/dev/null || true
-                dkms remove -m nvidia -v "$NV_VER" --all 2>/dev/null || true
+                NV_VER=""
             fi
+        fi
 
-            # Secure Boot 检测 (官方 DKMS 模块未签名无法加载) — 给出完整方案, 不只警告
-            if command -v mokutil >/dev/null 2>&1 \
-               && [[ "$(mokutil --sb-state 2>/dev/null)" == *"enabled"* ]]; then
-                warn "⚠ 检测到 Secure Boot 已启用!"
-                warn "  NVIDIA 官方驱动 DKMS 模块需签名才能加载, 二选一:"
-                warn "  A) BIOS 关闭 Secure Boot (推荐, 最简单)"
-                warn "  B) 保留 Secure Boot, 导入 DKMS 自签密钥:"
-                warn "     1) 安装完成后执行: sudo mokutil --import /var/lib/dkms/mok.pub"
-                warn "        (若提示文件不存在, 先 sh $NV_RUN --dkms --kernel-module-type=open 编译一次)"
-                warn "     2) 按提示设置一个临时密码 (如 1234)"
-                warn "     3) 重启进入蓝屏 MOK 管理: Enroll MOK → Continue → Yes → 输入密码"
-                warn "     4) 再重启即可加载模块 (验证: modinfo -F version nvidia)"
+        if [[ -z "$NV_VER" ]]; then
+            # 未装官方驱动 → 二选一: 生产稳定 595 (默认) / 最新特性 610
+            local NV_SKIP=0
+            if [[ "${FF_NV_SKIP:-0}" != "1" ]]; then
+                echo ""
+                echo -e "  ${CYAN}检测到 NVIDIA 独显 (官方驱动未安装)${NC}"
+                echo "    请选择驱动分支:"
+                echo "    1) 生产稳定 595.x (open 模块, rpmfusion dnf5 安装)  [推荐, 回车默认]"
+                echo "    2) 最新特性 610.x (dnf5 安装, 已知色斑 bug 风险)"
+                echo "    3) 跳过 (仅用核显 / 开源 nouveau)"
+                read -r -p "  请选择 [1/2/3]: " NV_CHOICE
+                case "${NV_CHOICE:-1}" in
+                    2)  NV_SKIP=2 ;;
+                    3)  NV_SKIP=1 ;;
+                    *)  NV_SKIP=0 ;;
+                esac
             fi
-
-            # 下载 + 校验
-            mkdir -p /opt/nvidia
-            if [[ ! -f "$NV_RUN" ]]; then
-                info "下载 NVIDIA $NV_TARGET (官方生产分支, ~400MB)..."
-                curl -fL --retry 3 -o "$NV_RUN" "https://download.nvidia.com/XFree86/Linux-x86_64/${NV_URL}" || \
-                    warn "驱动下载失败 (可稍后手动下载)"
-            fi
-            if [[ -f "$NV_RUN" ]]; then
-                NV_SHA=$(curl -fs --max-time 20 "https://download.nvidia.com/XFree86/Linux-x86_64/${NV_TARGET}/NVIDIA-Linux-x86_64-${NV_TARGET}.run.sha256sum" 2>/dev/null | awk '{print $1}' || true)
-                if [[ -n "$NV_SHA" ]] && ! echo "$NV_SHA  $NV_RUN" | sha256sum -c - >/dev/null 2>&1; then
-                    warn "⚠ 驱动校验失败, 删除后重新下载"
-                    rm -f "$NV_RUN"
+            if [[ "$NV_SKIP" -eq 1 ]]; then
+                info "已跳过 NVIDIA 驱动安装 (核显/nouveau 模式)"
+            elif [[ "$NV_SKIP" -eq 2 ]]; then
+                # 方案 B: 最新特性 610
+                if [[ -n "${FF_NV_VERSION:-}" && "${FF_NV_VERSION}" == 610.* ]]; then
+                    info "FF_NV_VERSION 指定 610, 直接安装..."
+                    install_nvidia_610
                 else
-                    info "✅ 驱动文件校验通过"
+                    install_nvidia_610
                 fi
-            fi
-
-            if [[ -f "$NV_RUN" ]]; then
-                info "安装 NVIDIA $NV_TARGET (open 内核模块 + DKMS, 静默模式)..."
-                # 关键参数: --kernel-module-type=open (Blackwell 必需) + --dkms (内核更新自动重编译)
-                if sh "$NV_RUN" --silent --dkms --kernel-module-type=open; then
-                    info "✅ NVIDIA $NV_TARGET (open 模块) 安装成功"
-                else
-                    warn "NVIDIA 安装失败, 可手动执行: sudo sh $NV_RUN --dkms --kernel-module-type=open"
-                fi
-            fi
+            else
+                # 方案 A (默认): 生产稳定 595
+                install_nvidia_595
             fi
         fi
 
