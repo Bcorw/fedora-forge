@@ -9,7 +9,7 @@
 #                    — 用 dnf5 离线升级(与 Discover 一致): 下载→重启→启动早期一次性应用
 #                    — 不用在线 dnf upgrade (KDE 运行中装包会并发写坏配置, 且新旧库混合)
 #    3. CPU/GPU驱动  — 自动识别 NVIDIA/AMD/Intel (厂商ID), 安装对应驱动+配套解码
-#                    — NVIDIA 固定生产版 595.80 (open 模块, 默认钉死; FF_NV_VERSION 可换)
+#                    — NVIDIA 固定生产分支 (默认 595.58.03; FF_NV_VERSION 可换; 已装 595.x 自动跳过)
 #                    — 电源管理: 台式机/独显本=官方方案; 仅轻薄本询问是否装 auto-cpufreq
 #                    — 装 auto-cpufreq 时生成回退官方方案脚本 (~/.local/scripts/power-official.sh)
 #                    — 音视频解码
@@ -114,7 +114,7 @@ for arg in "$@"; do
             echo ""
             echo "模块 (可组合, 无参数=执行 1-6 核心模块):"
             echo "  -source   软件源优化"
-            echo "  -gpu      CPU/GPU驱动(自动识别, NVIDIA固定595.80) + 电源方案 + 解码"
+            echo "  -gpu      CPU/GPU驱动(自动识别, NVIDIA生产分支595.58.03) + 电源方案 + 解码"
             echo "            环境变量: FF_NV_VERSION=595.xx 换NVIDIA版本; FF_POWER=auto|default 免交互"
             echo "            电源: 台式机/独显本自动官方方案; 轻薄本交互询问 auto-cpufreq"
             echo "  -term     终端配置 (字体 + Zsh/Starship/Zinit + Konsole/Kitty)"
@@ -736,6 +736,20 @@ optimize_gpu() {
     echo "$GPU_INFO" | grep -qi "\[8086:"           && HAS_INTEL=1
     info "检测: NVIDIA=$HAS_NVIDIA  AMD=$HAS_AMD  Intel=$HAS_INTEL"
 
+    # ── nomodeset 清理 (安装器应急参数) ──
+    # Fedora 安装器在独显直连/驱动未装时显示异常会自动加 nomodeset vga=791,
+    # 导致 GPU 内核驱动(KMS)不接管显示, 只有 simple-framebuffer/efifb 工作.
+    # 后果: NVIDIA/amdgpu 驱动装好后也无法正常显示/调亮度/加速.
+    # 处理: 检测到即移除 (这是应急参数不是用户配置), 提示重启后生效.
+    if grep -q "nomodeset" /proc/cmdline 2>/dev/null; then
+        info "⚠ 检测到内核参数 nomodeset (安装器应急参数, 阻止 GPU 驱动接管显示)"
+        info "  移除 nomodeset/vga=791, 重启后 GPU 驱动才能正常 KMS..."
+        grubby --update-kernel=ALL --remove-args="nomodeset vga=791" 2>/dev/null || true
+        info "  已移除, 请重启后重新运行脚本: sudo reboot && sudo bash $0"
+        info "  (验证: cat /proc/cmdline 不再有 nomodeset)"
+        exit 0
+    fi
+
     # 禁用系统默认电源管理服务 (幂等: 已 masked 则跳过, 避免重复 systemctl 调用)
     disable_service() {  # disable_service <服务名>
         local svc="$1"
@@ -946,6 +960,14 @@ EOF
         gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free \
         gstreamer1-libav gstreamer1-vaapi libva libva-utils || true
 
+    # ── OpenH264 for Firefox (Cisco 开源 H.264 编解码, 视频会议/网页视频硬解) ──
+    # fedora-cisco-openh264 仓库提供, 幂等: 仓库已启用则跳过
+    if ! dnf repolist 2>/dev/null | grep -q "fedora-cisco-openh264"; then
+        info "启用 fedora-cisco-openh264 仓库 (Firefox OpenH264 视频编解码)..."
+        "$DNF" config-manager setopt fedora-cisco-openh264.enabled=1 >/dev/null 2>&1 || true
+    fi
+    dnf_install_quiet openh264 gstreamer1-plugin-openh264 mozilla-openh264 || true
+
     # ── NVIDIA: 官方生产分支 (595.x) + open 内核模块 ──
     #  610.x = 新特性分支(测试版): 有显示管线回归 (color_pipeline 色斑/内屏黑屏/atomic commit 失败)
     #  595.x = 生产稳定分支; Blackwell (RTX 50) 必须用 open 内核模块 (-M=open)
@@ -955,17 +977,21 @@ EOF
 
         # ── 固定使用已验证的稳定版 ──
         #  610 新特性分支 bug 太多 (色斑/内屏黑屏/atomic commit 失败/Chrome 崩溃)
-        #  595 生产分支稳定; 但后续小版本也可能引入回归 (如 595.84 DP 问题),
-        #  故默认钉死实测稳定的 595.80. 换版本: FF_NV_VERSION=595.xx sudo bash $0 -gpu
-        NV_TARGET="${FF_NV_VERSION:-595.80}"
+        #  595 生产分支稳定; rpmfusion 实测稳定版为 595.58.03 (内核 6.12+ 需打 of_gpio 补丁),
+        #  官方 .run 最新生产版 595.91.07 (已内置 of_gpio compat). 换版本: FF_NV_VERSION=595.xx
+        NV_TARGET="${FF_NV_VERSION:-595.58.03}"
         if [[ "$NV_TARGET" == 610.* ]]; then
             warn "⚠ FF_NV_VERSION=610.x 为新特性分支(测试版), 已知 bug: 色斑/内屏黑屏/atomic commit 失败!"
         fi
         NV_URL="${NV_TARGET}/NVIDIA-Linux-x86_64-${NV_TARGET}.run"
         NV_RUN="/opt/nvidia/NVIDIA-Linux-x86_64-${NV_TARGET}.run"
 
-        if [[ -n "$NV_VER" && "$NV_VER" == "$NV_TARGET" ]]; then
-            info "✅ NVIDIA 驱动已是最新生产版 $NV_VER (跳过安装)"
+        # 已装 595.x 生产分支 (open 模块) 即跳过 — 不要求版本号完全相等,
+        #  兼容 rpmfusion dnf 装的 595.58.03 与官方 .run 的 595.80/595.91.07.
+        #  (旧逻辑只认精确版本, 会把 rpmfusion 595.58.03 误判为"旧驱动"卸载重装 .run,
+        #   121 2026-08 实测该 bug 会毁掉已配好的 dnf 版)
+        if [[ -n "$NV_VER" && "$NV_VER" == 595.* ]]; then
+            info "✅ NVIDIA 驱动已装 (生产分支 $NV_VER, open 模块), 跳过安装"
         else
             # 询问: 检测到 NVIDIA 但未装官方驱动 — 不自动强装
             #  (用户可能只用核显/需要 nouveau/Optimus 复杂场景; 跳过: 交互选 2 或 FF_NV_SKIP=1)
@@ -990,12 +1016,18 @@ EOF
                 dkms remove -m nvidia -v "$NV_VER" --all 2>/dev/null || true
             fi
 
-            # Secure Boot 检测 (官方 DKMS 模块未签名无法加载)
+            # Secure Boot 检测 (官方 DKMS 模块未签名无法加载) — 给出完整方案, 不只警告
             if command -v mokutil >/dev/null 2>&1 \
                && [[ "$(mokutil --sb-state 2>/dev/null)" == *"enabled"* ]]; then
                 warn "⚠ 检测到 Secure Boot 已启用!"
-                warn "  NVIDIA 官方驱动 DKMS 模块需签名才能加载, 建议 BIOS 关闭 Secure Boot"
-                warn "  或安装后执行: sudo mokutil --import /var/lib/dkms/mok.pub"
+                warn "  NVIDIA 官方驱动 DKMS 模块需签名才能加载, 二选一:"
+                warn "  A) BIOS 关闭 Secure Boot (推荐, 最简单)"
+                warn "  B) 保留 Secure Boot, 导入 DKMS 自签密钥:"
+                warn "     1) 安装完成后执行: sudo mokutil --import /var/lib/dkms/mok.pub"
+                warn "        (若提示文件不存在, 先 sh $NV_RUN --dkms --kernel-module-type=open 编译一次)"
+                warn "     2) 按提示设置一个临时密码 (如 1234)"
+                warn "     3) 重启进入蓝屏 MOK 管理: Enroll MOK → Continue → Yes → 输入密码"
+                warn "     4) 再重启即可加载模块 (验证: modinfo -F version nvidia)"
             fi
 
             # 下载 + 校验
@@ -1089,6 +1121,9 @@ EOF
         else
             info "安装 VA-API 硬解组件 (vainfo 缺失)..."
             dnf_install_quiet libva libva-utils mesa-va-drivers mesa-vdpau-drivers || true
+            # rpmfusion free 的 mesa-va-drivers 因法律原因不含 H.264/H.265 解码,
+            #   freeworld 版补全 (AMD 硬解完整; .i686 供 32 位应用)
+            dnf_install_quiet mesa-va-drivers-freeworld mesa-va-drivers-freeworld.i686 || true
         fi
 
         # ── 亮度 100% 反而变暗修复 (2026-08 联想 780M 实测) ──
@@ -1435,9 +1470,11 @@ ZSHRC
     fi
     if [[ -d "$FZFTAB_DIR" && ! -f "$FZFTAB_DIR/modules/Src/aloxaf/fzftab.so" ]]; then
         info "编译 fzf-tab 原生模块 (compcap)..."
-        dnf_ensure gcc make ncurses-devel || true
+        # 依赖: gcc/make/ncurses-devel 编译 + autoconf/automake (preconfig 生成 configure)
+        dnf_ensure gcc make ncurses-devel autoconf automake || true
         chown -R "$ACTUAL_USER:" "$FZFTAB_DIR" 2>/dev/null || true
-        if su - "$ACTUAL_USER" -c "cd '${FZFTAB_DIR}' && zsh -fc 'source ./fzf-tab.zsh && build-fzf-tab-module'" >/dev/null 2>&1 \
+        # 编译输出进日志 (不吞 stderr), 失败时便于排查真实原因 (如缺 autoconf)
+        if su - "$ACTUAL_USER" -c "cd '${FZFTAB_DIR}' && zsh -fc 'source ./fzf-tab.zsh && build-fzf-tab-module'" \
            && [[ -f "$FZFTAB_DIR/modules/Src/aloxaf/fzftab.so" ]]; then
             info "✅ fzf-tab compcap 模块编译完成 (Tab 补全列表将正常显示)"
         else
@@ -1726,6 +1763,9 @@ KITTYFALLBACK
     echo ""
     info "Terminal setup check:"
     local _tcmd
+    # 自检运行在 sudo 环境, 补上用户本地二进制路径 (starship 等装在 ~/.local/bin),
+    # 否则 command -v 找不到会误报 not found
+    export PATH="${ACTUAL_HOME}/.local/bin:${PATH}"
     for _tcmd in zsh starship fastfetch fzf yazi; do
         if command -v "$_tcmd" >/dev/null 2>&1; then
             echo -e "  ${GREEN}✓${NC} $_tcmd installed"
@@ -2059,6 +2099,47 @@ EOD
 }
 
 # ============================================================================
+#  壁纸归档: 全模块跑完后, 把项目 wallpapers/ 整个移动到用户图片目录
+# ============================================================================
+# 时机: main() 所有模块之后调用 — 5/7 主题模块还要用 wallpapers/ 里的图设登录背景,
+#  必须先复制再移动, 故不能提前到模块内.
+# 幂等: 源不存在(已移走)或目标已存在则跳过; 图片目录用 xdg-user-dir 解析
+#  (中文系统 ~/图片, 英文 ~/Pictures), 失败兜底顺序: ~/图片 → ~/Pictures
+move_wallpapers() {
+    local WP_SRC="${RES_DIR}/wallpapers"
+    [[ -d "$WP_SRC" ]] || { info "wallpapers 目录不存在 (${WP_SRC}), 跳过归档"; return 0; }
+
+    # 解析用户图片目录 (xdg-user-dir 以用户身份运行, sudo 下直接调会拿到 root 的)
+    local PIC_DIR=""
+    PIC_DIR=$(su - "$ACTUAL_USER" -c "xdg-user-dir PICTURES" 2>/dev/null | tr -d '\r\n')
+    # 兜底: 空/不存在时按常见目录猜测
+    if [[ -z "$PIC_DIR" || ! -d "$PIC_DIR" ]]; then
+        if [[ -d "${ACTUAL_HOME}/图片" ]]; then
+            PIC_DIR="${ACTUAL_HOME}/图片"
+        elif [[ -d "${ACTUAL_HOME}/Pictures" ]]; then
+            PIC_DIR="${ACTUAL_HOME}/Pictures"
+        else
+            PIC_DIR="${ACTUAL_HOME}/图片"
+        fi
+    fi
+    ensure_user_dir "$PIC_DIR"
+
+    local WP_DST="${PIC_DIR}/wallpapers"
+    if [[ -d "$WP_DST" ]]; then
+        info "图片目录已有 wallpapers/ (${WP_DST}), 跳过移动"
+        return 0
+    fi
+
+    info "归档壁纸: ${WP_SRC} → ${WP_DST}"
+    if mv "$WP_SRC" "$WP_DST" 2>/dev/null; then
+        chown -R "$ACTUAL_USER:" "$WP_DST" 2>/dev/null || true
+        info "✅ 壁纸已移动到图片目录: ${WP_DST} ($(find "$WP_DST" -type f | wc -l) 张)"
+    else
+        warn "wallpapers 移动失败 (可手动: mv ${WP_SRC} ${WP_DST})"
+    fi
+}
+
+# ============================================================================
 #  6/7  应用管理 (卸载 + 安装)
 # ============================================================================
 manage_apps() {
@@ -2366,6 +2447,8 @@ REPO
     # MissionCenter 运行时依赖: nethogs(网络流量) + lm_sensors(传感器检测),
     # 缺失时其 magpie 组件报 "Nethogs not found / sensors-detect not found"
     dnf_ensure nethogs lm_sensors
+    # AppImage 运行时: fuse-libs 缺失时 AppImage 直接无法执行 (报 "No such file or directory")
+    dnf_ensure fuse-libs
     # 逐个安装: 先确保 flathub 远端存在, 每包独立判断已装状态与结果,
     # 避免整批失败被静默吞掉 (曾因 LocalSend 包名错误导致全部未装)
     if ! flatpak remotes 2>/dev/null | grep -q flathub; then
@@ -2491,6 +2574,8 @@ main() {
     [[ "$RUN_APPS" -eq 1 ]]   && manage_apps
     [[ "$RUN_STEAM" -eq 1 ]]  && setup_steam
 
+    # 壁纸归档: 所有模块完成后 (5/7 登录背景图已用过 wallpapers/) → 移动到图片目录
+    move_wallpapers
 
     # ═══════════ 清理═══════════
     info "清理临时文件..."
