@@ -720,6 +720,12 @@ configure_power_management() {
 
     # 安装并启用 power-profiles-daemon (KDE Plasma 电源滑块的控制平面)
     if ! rpm -q power-profiles-daemon >/dev/null 2>&1; then
+        # tuned-ppd 提供同名的 ppd-service, 与 power-profiles-daemon 冲突 (depsolve 失败),
+        # 本脚本明确选择 PPD 作为控制平面, 先卸载 tuned-ppd
+        if rpm -q tuned-ppd >/dev/null 2>&1; then
+            info "检测到 tuned-ppd 与 power-profiles-daemon 冲突, 移除 tuned-ppd..."
+            "$DNF" remove -y tuned-ppd >/dev/null 2>&1 || true
+        fi
         info "安装 power-profiles-daemon (KDE 电源模式 Power Saver/Balanced/Performance)..."
         dnf_install_quiet power-profiles-daemon || warn "power-profiles-daemon 安装失败"
     fi
@@ -851,6 +857,25 @@ EOF
         info "已写入 /etc/modprobe.d/nvidia.conf (modeset=1 fbdev=1)"
     fi
 
+    # RTD3 运行时省电 (笔记本混合模式: dGPU 空闲进入 D3; rpmfusion 更新可能覆盖
+    #  本文件, 幂等补齐, 缺失即追加)
+    # 0x03 = RTD3 无 powerd (Fedora 无 nvidia-powerd 包) / 0x02 需 nvidia-powerd
+    if ! grep -q 'NVreg_DynamicPowerManagement' /etc/modprobe.d/nvidia.conf 2>/dev/null; then
+        printf '\n%s\n%s\n' \
+            '# RTD3 运行时省电 (混合模式 dGPU 空闲时进入 D3): 0x03 = RTD3 无 powerd' \
+            'options nvidia NVreg_DynamicPowerManagement=0x03' \
+            >> /etc/modprobe.d/nvidia.conf
+        info "已追加 RTD3 配置 (NVreg_DynamicPowerManagement=0x03)"
+    fi
+    # S0ix 睡眠省电 (s2idle 深度低功耗; 唤醒异常可改回 0)
+    if ! grep -q 'NVreg_EnableS0ixPowerManagement' /etc/modprobe.d/nvidia.conf 2>/dev/null; then
+        printf '%s\n%s\n' \
+            '# s2idle 睡眠省电 (Modern Standby 深度低功耗); 若睡眠唤醒异常可改回 0' \
+            'options nvidia NVreg_EnableS0ixPowerManagement=1' \
+            >> /etc/modprobe.d/nvidia.conf
+        info "已追加 S0ix 省电配置 (NVreg_EnableS0ixPowerManagement=1)"
+    fi
+
     # nouveau 黑名单: rpmfusion 包自带, 缺失才补
     if [[ ! -f /etc/modprobe.d/blacklist-nouveau.conf ]]; then
         cat > /etc/modprobe.d/blacklist-nouveau.conf <<'EOF'
@@ -868,8 +893,12 @@ EOF
         && info "✅ initramfs 已重建" \
         || warn "dracut 重建失败, 可手动: sudo dracut --force"
 
-    # NVIDIA persistence daemon (提供即启用, 非成功必要条件)
-    if systemctl list-unit-files nvidia-persistenced.service >/dev/null 2>&1; then
+    # NVIDIA persistence daemon: 桌面独显才启用 (笔记本 RTD3 与 persistenced 冲突,
+    #  保持持久化会让 dGPU 无法进入 D3, 违背省电目标)
+    if grep -qi 'laptop' /proc/driver/nvidia/gpus/*/information 2>/dev/null; then
+        info "✅ 笔记本 dGPU: 不启用 nvidia-persistenced (避免阻止 RTD3 进入 D3)"
+        systemctl disable nvidia-persistenced >/dev/null 2>&1 || true
+    elif systemctl list-unit-files nvidia-persistenced.service >/dev/null 2>&1; then
         systemctl enable --now nvidia-persistenced >/dev/null 2>&1 || true
     fi
     # Dynamic Boost (笔记本 GPU 功耗墙动态调整; Blackwell 缺陷修复前可能静默运行, 无害)
@@ -1053,9 +1082,11 @@ install_amd_gpu_stack() {
     #       枚举值实查自 amd_shared.h). 幂等: 已设置则跳过.
     #       保留依据: 已验证硬件问题的特定条件 workaround (ChatGPT 认可此类).
     local HAS_CURVE_BUG=0
-    if ls /sys/class/backlight/amdgpu_bl* >/dev/null 2>&1 \
-       && dmesg 2>/dev/null | grep -q "Using custom brightness curve"; then
-        HAS_CURVE_BUG=1
+    if ls /sys/class/backlight/amdgpu_bl* >/dev/null 2>&1; then
+        # dmesg 可能被 kernel.dmesg_restrict 挡住, 回退用 journalctl 检测
+        local CURVE_MSG="$(dmesg 2>/dev/null | grep -m1 "Using custom brightness curve")"
+        [[ -z "$CURVE_MSG" ]] && CURVE_MSG="$(journalctl -b -k --no-pager 2>/dev/null | grep -m1 "Using custom brightness curve")"
+        [[ -n "$CURVE_MSG" ]] && HAS_CURVE_BUG=1
     fi
     if [[ "$HAS_CURVE_BUG" -eq 1 ]]; then
         local DC_MASK="$(cat /sys/module/amdgpu/parameters/dcdebugmask 2>/dev/null || echo 0)"
