@@ -8,10 +8,9 @@
 #    2. 系统升级检查 — 仅全量运行(-all/无参数)时执行; 单模块执行自动跳过
 #                    — 用 dnf5 离线升级(与 Discover 一致): 下载→重启→启动早期一次性应用
 #                    — 不用在线 dnf upgrade (KDE 运行中装包会并发写坏配置, 且新旧库混合)
-#    3. CPU/GPU驱动  — 自动识别 NVIDIA/AMD/Intel (厂商ID), 安装对应驱动+配套解码
-#                    — NVIDIA 固定生产分支 (默认 595.58.03; FF_NV_VERSION 可换; 已装 595.x 自动跳过)
-#                    — 电源管理: 台式机/独显本=官方方案; 仅轻薄本询问是否装 auto-cpufreq
-#                    — 装 auto-cpufreq 时生成回退官方方案脚本 (~/.local/scripts/power-official.sh)
+#    3. CPU/GPU驱动  — 自动识别 NVIDIA/AMD/Intel (PCI class 03xx + 厂商ID)
+#                    — NVIDIA: RPM Fusion akmod-nvidia (版本跟随仓库, akmods+modinfo 验证)
+#                    — CPU 电源: Fedora 原生 power-profiles-daemon (不装 auto-cpufreq/TLP)
 #                    — 音视频解码
 #    4. 终端配置     — 字体 + Zsh/Starship/Zinit + Konsole/Kitty
 #    5. 主题&系统    — Breeze主题 + 登录背景 + SELinux + GRUB
@@ -86,8 +85,6 @@ gh_curl() {
 # ────────────────────────────────────────────── 参数解析
 RUN_SOURCE=0; RUN_GPU=0; RUN_TERM=0; RUN_THEME=0; RUN_APPS=0; RUN_STEAM=0
 RUN_UPGRADE=1
-# 电源管理方案: ask=交互选择(默认, 笔记本询问) / auto=auto-cpufreq / default=系统默认(官方)
-POWER_MODE="${FF_POWER:-ask}"
 HAS_MODULE=0
 RUN_ALL=0
 
@@ -104,7 +101,6 @@ for arg in "$@"; do
         -apps)    RUN_APPS=1;   HAS_MODULE=1 ;;
         -steam)   RUN_STEAM=1;  HAS_MODULE=1 ;;
         -no-upgrade) RUN_UPGRADE=0 ;;
-        -power=*)  POWER_MODE="${arg#-power=}" ;;
         -test)    : ;; # 已在上面启用 TEST_MODE
         -all)
             RUN_SOURCE=1; RUN_GPU=1; RUN_TERM=1
@@ -114,9 +110,9 @@ for arg in "$@"; do
             echo ""
             echo "模块 (可组合, 无参数=执行 1-6 核心模块):"
             echo "  -source   软件源优化"
-            echo "  -gpu      CPU/GPU驱动(自动识别, NVIDIA二选一: 1生产稳定595[默认] 2最新610) + 电源 + 解码"
-            echo "            环境变量: FF_NV_VERSION=595.xx 换NVIDIA版本; FF_POWER=auto|default 免交互"
-            echo "            电源: 台式机/独显本自动官方方案; 轻薄本交互询问 auto-cpufreq"
+            echo "  -gpu      CPU/GPU驱动 (自动识别: NVIDIA=RPM Fusion akmod / AMD=amdgpu / Intel=i915)"
+            echo "            + Fedora 原生电源管理 (power-profiles-daemon) + 音视频解码"
+            echo "            环境变量: FF_NVIDIA_CUDA=1 额外装 CUDA/NVENC/NVDEC"
             echo "  -term     终端配置 (字体 + Zsh/Starship/Zinit + Konsole/Kitty)"
             echo "  -theme    主题 & 系统优化 (含 NetworkManager 优化)"
             echo "  -apps     应用管理 (卸载 + 安装)"
@@ -124,7 +120,6 @@ for arg in "$@"; do
             echo "  -all      执行全部模块 (含 Steam)"
             echo "  -test     测试模式: 不装包、不重启, 仅验证流程"
             echo "  -no-upgrade 跳过系统升级检查 (默认自动升级)"
-            echo "  -power=auto|default  电源方案: 系统默认(官方) / auto-cpufreq"
             exit 0 ;;
         *) die "未知模块/参数: $arg (用 -h 查看可用模块, 未指定模块时将执行核心模块)" ;;
     esac
@@ -135,12 +130,6 @@ done
 
 # 默认不执行 -steam，仅执行核心模块
 [[ "$HAS_MODULE" -eq 0 ]] && { RUN_SOURCE=1; RUN_GPU=1; RUN_TERM=1; RUN_THEME=1; RUN_APPS=1; }
-
-# 校验电源方案取值 (非法值回退交互选择)
-case "$POWER_MODE" in
-    ask|auto|default) : ;;
-    *) warn "无效电源方案: $POWER_MODE (可选 auto/default/ask), 回退交互选择"; POWER_MODE="ask" ;;
-esac
 
 # ────────────────────────────────────────────── 权限 & 环境检测
 # 测试模式 (-test) 是只读演练, 所有写操作已被拦截, 无需真实 root
@@ -712,225 +701,228 @@ SRCSCRIPT
 }
 
 # ============================================================================
-#  NVIDIA of_gpio 补丁应用 (内核 6.12+ 编译修复, 121 2026-08 实测)
 # ============================================================================
-# 内核 6.12+ 移除了 <linux/of_gpio.h> 和 of_get_named_gpio() (仅 Tegra MIPI DSI
-#  面板用, x86 永不执行), rpmfusion 595.58.03 无条件 include → akmods 编译报
-#  "fatal error: linux/of_gpio.h: No such file or directory".
-# 本函数: 从 kmodsrc 源码 tar 打补丁 → 重打包 src.rpm → 替换 /usr/src/akmods/.
-# 补丁文件在项目 patches/nvidia-of_gpio-fix.patch (已对真实源码验证可干净应用).
-apply_nvidia_ofgpio_patch() {
-    local NVSRC_DIR NV_VER_SRC KMOD_SRC KMOD_SRC_RPM
-    NV_VER_SRC=$(rpm -q xorg-x11-drv-nvidia-kmodsrc --qf '%{version}' 2>/dev/null || echo 0)
-    KMOD_SRC="/usr/share/nvidia-kmod-${NV_VER_SRC}/nvidia-kmod-${NV_VER_SRC}-x86_64.tar.xz"
-    local PATCH_FILE="${RES_DIR}/patches/nvidia-of_gpio-fix.patch"
+#  CPU 电源管理 — Fedora 原生方案 (ChatGPT 重构: 去 auto-cpufreq/TLP)
+#  原则: 不装 auto-cpufreq / 不装 TLP / 不手动改 governor/EPP / 不强制 amd_pstate
+#  只做: 检测 scaling driver → 启用 power-profiles-daemon (KDE 控制平面)
+#        → tuned 冲突处理 → 输出状态
+# ============================================================================
+configure_power_management() {
+    info "CPU 电源管理: Fedora 原生 (power-profiles-daemon, 不装 auto-cpufreq/TLP)"
 
-    [[ -f "$KMOD_SRC" ]] || { warn "kmodsrc 源码未找到: $KMOD_SRC (跳过补丁, 编译可能失败)"; return 1; }
-    [[ -f "$PATCH_FILE" ]] || { warn "补丁文件未找到: $PATCH_FILE (跳过补丁, 编译可能失败)"; return 1; }
+    # 检测当前 scaling driver (amd_pstate / intel_pstate / acpi-cpufreq)
+    SCALING_DRIVER=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null || echo "未知")
+    info "CPU scaling driver: $SCALING_DRIVER"
+    # amd_pstate / intel_pstate 是内核原生, 保留默认行为, 不修改 kernel cmdline
+    if [[ "$SCALING_DRIVER" == *pstate* ]]; then
+        info "✅ 使用内核原生 $SCALING_DRIVER (P-State 由内核/固件自行管理, 不追加内核参数)"
+    fi
 
-    info "应用 of_gpio 补丁 (内核 6.12+ 移除 of_gpio.h, 595.58.03 需此修复才能编译)..."
-    local WORK="/tmp/nvidia-ofgpio-fix"
-    rm -rf "$WORK" && mkdir -p "$WORK/kernel"
-    tar xf "$KMOD_SRC" -C "$WORK/kernel" 2>/dev/null || { warn "kmodsrc 解包失败"; return 1; }
+    # 安装并启用 power-profiles-daemon (KDE Plasma 电源滑块的控制平面)
+    if ! rpm -q power-profiles-daemon >/dev/null 2>&1; then
+        info "安装 power-profiles-daemon (KDE 电源模式 Power Saver/Balanced/Performance)..."
+        dnf_install_quiet power-profiles-daemon || warn "power-profiles-daemon 安装失败"
+    fi
+    systemctl unmask power-profiles-daemon >/dev/null 2>&1 || true
+    systemctl enable --now power-profiles-daemon >/dev/null 2>&1 || true
 
-    # 打补丁 (两个变体: kernel + kernel-open)
-    if ( cd "$WORK/kernel" && patch -p1 -s < "$PATCH_FILE" ); then
-        info "✅ 补丁应用成功"
+    # tuned 冲突处理: 明确选择 PPD 作为控制平面, 停用 tuned 避免双电源管理竞争
+    if systemctl is-active tuned >/dev/null 2>&1; then
+        info "检测到 tuned 正在运行, 与 power-profiles-daemon 竞争 CPU 频率控制..."
+        systemctl disable --now tuned >/dev/null 2>&1 || true
+        info "已停用 tuned (PPD 为唯一电源控制平面; 如需还原: sudo systemctl enable --now tuned)"
+    fi
+
+    # AMD pstate 只检测输出, 不强制写入 (不同 CPU/BIOS/内核组合由内核自行选择)
+    if [[ -r /sys/devices/system/cpu/amd_pstate/status ]]; then
+        info "AMD pstate: $(cat /sys/devices/system/cpu/amd_pstate/status 2>/dev/null)"
+    fi
+
+    # 输出当前电源模式
+    if command -v powerprofilesctl >/dev/null 2>&1; then
+        info "当前电源模式: $(powerprofilesctl get 2>/dev/null || echo unknown) (切换: powerprofilesctl set balanced|performance|power-saver)"
+    fi
+}
+
+# ============================================================================
+#  NVIDIA 驱动安装 — RPM Fusion akmod 唯一方案 (ChatGPT 重构)
+#  删除: .run / 固定 595/610 / versionlock / of_gpio 补丁
+#  流程: Secure Boot 检测 → kernel-devel → akmod-nvidia → mark user
+#        → akmods --force → 等待模块构建 → modinfo 验证
+#  版本由 RPM Fusion 仓库决定, 脚本不写死任何版本号.
+# ============================================================================
+install_nvidia_driver() {
+    info "NVIDIA: 使用 RPM Fusion akmod-nvidia (版本由仓库决定, 不固定/不锁版本)"
+
+    # ── Secure Boot ──
+    local SB_STATE="unknown"
+    if command -v mokutil >/dev/null 2>&1; then
+        SB_STATE=$(mokutil --sb-state 2>/dev/null || echo unknown)
+    fi
+    if [[ "$SB_STATE" == *enabled* ]]; then
+        warn "⚠ Secure Boot 已启用 — akmod 内核模块必须完成 MOK 签名导入才能加载"
+        warn "  推荐: BIOS/UEFI 关闭 Secure Boot; 或按 RPM Fusion MOK 流程 (mokutil --import /etc/pki/akmods/certs/public_key.der)"
     else
-        # 可能已打过 (幂等) — 检查守卫是否已存在
-        if grep -q "LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)" "$WORK/kernel/kernel-open/common/inc/nv-linux.h" 2>/dev/null; then
-            info "✅ of_gpio 补丁已存在 (幂等跳过)"
-        else
-            warn "of_gpio 补丁应用失败, 编译可能失败 (可手动: cd $WORK/kernel && patch -p1 < $PATCH_FILE)"
+        info "Secure Boot: 未启用 (驱动可正常加载)"
+    fi
+
+    # ── 当前内核 + kernel-devel (akmods 编译必需) ──
+    local KVER
+    KVER=$(uname -r)
+    info "NVIDIA 当前运行内核: $KVER"
+    if ! rpm -q "kernel-devel-$KVER" >/dev/null 2>&1; then
+        info "安装 kernel-devel-$KVER (akmods 编译环境)..."
+        dnf_install_quiet "kernel-devel-$KVER" || warn "kernel-devel-$KVER 安装失败, 模块可能无法编译"
+    fi
+
+    # ── 主驱动: akmod-nvidia (已装则跳过安装, 但仍会验证模块) ──
+    if rpm -q akmod-nvidia >/dev/null 2>&1; then
+        info "✅ akmod-nvidia 已安装"
+    else
+        info "安装 RPM Fusion akmod-nvidia (首次构建需几分钟, 勿在编译中重启)..."
+        if ! "$DNF" install -y akmod-nvidia >/dev/null 2>&1; then
+            warn "❌ akmod-nvidia 安装失败 (检查: dnf repolist | grep rpmfusion)"
             return 1
         fi
     fi
+    # 防 autoremove 误删 (新系统部署后易被当作 orphan)
+    "$DNF" mark user akmod-nvidia >/dev/null 2>&1 || true
 
-    # 重打包 tar (akmods 从 tar 构建 src.rpm)
-    local TAR_OUT="/tmp/nvidia-kmod-${NV_VER_SRC}-x86_64.tar.xz"
-    rm -f "$TAR_OUT"
-    ( cd "$WORK/kernel" && tar cJf "$TAR_OUT" kernel kernel-open supported-gpus 2>/dev/null ) \
-        || { warn "重打包失败"; return 1; }
+    # ── CUDA 可选 (FF_NVIDIA_CUDA=1) ──
+    if [[ "${FF_NVIDIA_CUDA:-0}" == "1" ]]; then
+        info "安装 CUDA / NVENC / NVDEC 用户空间组件..."
+        dnf_install_quiet xorg-x11-drv-nvidia-cuda || warn "CUDA 扩展安装失败, 基础驱动不受影响"
+    fi
 
-    # 重新构建 src.rpm 并替换 akmods 用的源 (rpmfusion 的 akmods 用 .latest 指针对应 src.rpm)
-    # 方案: 直接替换 kmodsrc 包内的 tar (akmodsbuild 从它生成 src.rpm)
-    if cp "$TAR_OUT" "$KMOD_SRC" 2>/dev/null; then
-        chmod 644 "$KMOD_SRC" 2>/dev/null || true
-        info "✅ 已替换 ${KMOD_SRC} (打补丁版)"
-        return 0
+    # ── 强制 akmods 构建 + 等待模块生成 (可靠逻辑, 非固定 sleep) ──
+    if command -v akmods >/dev/null 2>&1; then
+        info "akmods --force 构建 NVIDIA 内核模块..."
+        akmods --force >/dev/null 2>&1 || warn "akmods 返回非零状态 (查看: akmods --status; ls /var/cache/akmods/nvidia*/)"
     else
-        warn "替换 kmodsrc 失败 (可手动: sudo cp $TAR_OUT $KMOD_SRC)"
+        warn "❌ akmods 命令不存在 (请安装 akmods 包)"
+        return 1
+    fi
+
+    # 周期性检查模块生成 (最多 ~5 分钟), 不盲目 sleep
+    NV_VER=""
+    local n=0
+    while [[ $n -lt 30 ]]; do
+        NV_VER=$(modinfo -F version nvidia 2>/dev/null || true)
+        [[ -n "$NV_VER" ]] && break
+        # 内核模块路径直接探测 (modinfo 未刷新的兜底)
+        if find "/lib/modules/$KVER" -type f -name 'nvidia.ko*' 2>/dev/null | grep -q .; then
+            NV_VER=$(modinfo -F version nvidia 2>/dev/null || echo "生成中")
+            [[ "$NV_VER" != "生成中" ]] && break
+        fi
+        sleep 10
+        n=$((n+1))
+    done
+
+    if [[ -n "$NV_VER" ]]; then
+        info "✅ NVIDIA 内核模块已生成: $NV_VER"
+    else
+        warn "⚠ NVIDIA 内核模块在 5 分钟内未生成 (编译失败或依赖缺失)"
+        warn "  排查: akmods --status; ls /var/cache/akmods/nvidia*/; ls /var/cache/akmods/nvidia*/*.failed.log"
+        warn "  模块就绪后手动: sudo dracut --force && sudo reboot"
         return 1
     fi
 }
 
 # ============================================================================
-#  NVIDIA 方案 A: 生产稳定 595 分支 (dnf5 在线, 默认)
+#  NVIDIA 配置 — 仅在模块确认生成后 (ChatGPT 重构)
+#  模块未生成时绝不写入 force_drivers initramfs 配置.
 # ============================================================================
-# 121 2026-08 实测定稿链路:
-#  1. 装编译环境 akmods dkms kernel-devel (必须与运行内核同版本)
-#  2. --disablerepo=rpmfusion-nonfree-updates 防依赖解析升级到 610 (色斑分支)
-#  3. akmod-nvidia + xorg-x11-drv-nvidia 全套 595.58.03
-#  4. 打 of_gpio 补丁 → akmods --force 编译 (内核 6.12+ 移除 of_gpio.h)
-#  5. xorg-x11-drv-nvidia-power + nvidia-powerd/persistenced (65W→140W 功耗解锁)
-#  6. dnf versionlock 锁 nvidia 包防升级回 610
-install_nvidia_595() {
-    local NV_TARGET="${FF_NV_VERSION:-595.58.03}"
-    info "方案 A: 生产稳定 595 分支 — dnf5 安装 rpmfusion $NV_TARGET (open 模块)..."
-
-    # 1. 编译环境
-    info "安装编译环境 (akmods dkms kernel-devel)..."
-    dnf_ensure akmods dkms 2>/dev/null || true
-    local KVER KDEV
-    KVER=$(uname -r)
-    KDEV=$(rpm -q kernel-devel 2>/dev/null || true)
-    if [[ -z "$KDEV" || "$KDEV" != *"$KVER"* ]]; then
-        info "安装 kernel-devel-$KVER (akmods 编译必需, 必须与运行内核同版本)..."
-        "$DNF" install -y "kernel-devel-$KVER" >/dev/null 2>&1 \
-            || warn "kernel-devel-$KVER 安装失败, 编译将无法进行"
+configure_nvidia() {
+    # 模块必须已存在 (install_nvidia_driver 已验证), 再写 dracut 强制加载
+    if ! modinfo -F version nvidia >/dev/null 2>&1; then
+        warn "NVIDIA 模块不存在, 跳过 initramfs/服务配置 (避免制造启动失败)"
+        rm -f /etc/dracut.conf.d/90-nvidia.conf 2>/dev/null || true
+        return 1
     fi
 
-    # 2+3. 安装 595.58.03 全套 (防 610)
-    info "安装 nvidia 595 全套 (--disablerepo 防依赖升级到 610)..."
-    "$DNF" install -y --disablerepo=rpmfusion-nonfree-updates \
-        "akmod-nvidia-3:${NV_TARGET}" \
-        "xorg-x11-drv-nvidia-3:${NV_TARGET}" \
-        "xorg-x11-drv-nvidia-cuda-3:${NV_TARGET}" \
-        nvidia-settings nvidia-modprobe nvidia-persistenced nvidia-xconfig >/dev/null 2>&1 \
-        || { warn "nvidia 595 安装失败 (检查仓库/网络)"; return 1; }
-
-    # 4. of_gpio 补丁 + 编译 (内核 6.12+ 需要)
-    apply_nvidia_ofgpio_patch
-    # Secure Boot 检测 (官方 DKMS 模块未签名无法加载) — 给出完整方案, 不只警告
-    if command -v mokutil >/dev/null 2>&1 \
-       && [[ "$(mokutil --sb-state 2>/dev/null)" == *"enabled"* ]]; then
-        warn "⚠ 检测到 Secure Boot 已启用!"
-        warn "  NVIDIA 官方驱动 DKMS 模块需签名才能加载, 二选一:"
-        warn "  A) BIOS 关闭 Secure Boot (推荐, 最简单)"
-        warn "  B) 保留 Secure Boot, 导入 DKMS 自签密钥:"
-        warn "     1) 编译完成后执行: sudo mokutil --import /var/lib/dkms/mok.pub"
-        warn "     2) 按提示设置一个临时密码 (如 1234)"
-        warn "     3) 重启进入蓝屏 MOK 管理: Enroll MOK → Continue → Yes → 输入密码"
-        warn "     4) 再重启即可加载模块 (验证: modinfo -F version nvidia)"
-    fi
-    info "akmods --force 编译内核模块 (约 3-10 分钟)..."
-    if akmods --force 2>&1 | tail -5; then
-        info "✅ akmods 编译完成"
+    # DRM KMS (Wayland 必需): rpmfusion 包自带 /etc/modprobe.d/nvidia.conf,
+    #  存在则不重复写; 缺失才补 modeset=1 fbdev=1
+    if [[ -f /etc/modprobe.d/nvidia.conf ]]; then
+        info "✅ nvidia_drm 配置已由 rpmfusion 包提供 (modeset: $(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null || echo '模块未加载, 重启后生效'))"
     else
-        warn "akmods 编译失败, 查看: ls /var/cache/akmods/nvidia*/*.failed.log"
+        cat > /etc/modprobe.d/nvidia.conf <<'EOF'
+options nvidia_drm modeset=1 fbdev=1
+EOF
+        info "已写入 /etc/modprobe.d/nvidia.conf (modeset=1 fbdev=1)"
     fi
 
-    # 5. power 包 + 双服务 (65W→140W 功耗解锁, 121 实测关键)
-    info "安装 nvidia-power (Dynamic Boost) + 启用守护进程..."
-    "$DNF" install -y --disablerepo=rpmfusion-nonfree-updates \
-        "xorg-x11-drv-nvidia-power-3:${NV_TARGET}" >/dev/null 2>&1 \
-        || warn "xorg-x11-drv-nvidia-power 安装失败 (功耗可能锁 65W)"
-    systemctl enable --now nvidia-powerd >/dev/null 2>&1 || true
-    systemctl enable --now nvidia-persistenced >/dev/null 2>&1 || true
-    info "✅ nvidia-powerd + nvidia-persistenced 已启用 (重启后 nvidia-smi 应显示 140W 上限)"
-
-    # 6. versionlock 防升级回 610
-    if command -v dnf versionlock >/dev/null 2>&1 || dnf versionlock --help >/dev/null 2>&1; then
-        dnf versionlock add akmod-nvidia kmod-nvidia xorg-x11-drv-nvidia \
-            xorg-x11-drv-nvidia-cuda xorg-x11-drv-nvidia-power \
-            nvidia-settings nvidia-modprobe nvidia-persistenced nvidia-xconfig >/dev/null 2>&1 \
-            && info "✅ dnf versionlock 已锁 nvidia 包 (防升级回 610)"
+    # nouveau 黑名单: rpmfusion 包自带, 缺失才补
+    if [[ ! -f /etc/modprobe.d/blacklist-nouveau.conf ]]; then
+        cat > /etc/modprobe.d/blacklist-nouveau.conf <<'EOF'
+blacklist nouveau
+options nouveau modeset=0
+EOF
     fi
+
+    # initramfs 强制加载 (模块已确认存在才写)
+    cat > /etc/dracut.conf.d/90-nvidia.conf <<'EOF'
+force_drivers+=" nvidia nvidia_modeset nvidia_uvm nvidia_drm "
+EOF
+    info "重建 initramfs (强制加载 nvidia 模块)..."
+    dracut --force --kver "$(uname -r)" >/dev/null 2>&1 \
+        && info "✅ initramfs 已重建" \
+        || warn "dracut 重建失败, 可手动: sudo dracut --force"
+
+    # NVIDIA persistence daemon (提供即启用, 非成功必要条件)
+    if systemctl list-unit-files nvidia-persistenced.service >/dev/null 2>&1; then
+        systemctl enable --now nvidia-persistenced >/dev/null 2>&1 || true
+    fi
+    # Dynamic Boost (笔记本 GPU 功耗墙动态调整; Blackwell 缺陷修复前可能静默运行, 无害)
+    if command -v nvidia-powerd >/dev/null 2>&1; then
+        systemctl enable --now nvidia-powerd >/dev/null 2>&1 || true
+    fi
+
+    # VA-API 视频硬解桥接
+    dnf_install_quiet libva-nvidia-driver vdpauinfo || true
+
+    info "✅ NVIDIA 配置完成 (DRM KMS + initramfs + 服务), 重启后生效"
 }
 
 # ============================================================================
-#  NVIDIA 方案 B: 最新特性 610 分支 (dnf5 在线, 追新)
+#  硬件服务初始化 (蓝牙/udev/linger) — 从 GPU 模块移出 (ChatGPT 重构)
+#  GPU 模块只负责 GPU; 蓝牙/udev 等与显卡无关的系统服务在此统一初始化.
 # ============================================================================
-# 610 = 新特性分支(测试性质): 显示管线回归多 (color_pipeline 色斑/内屏黑屏/
-#  atomic commit 失败, 用户 121 多发行版实测). 选择即接受风险.
-# 优点: 无需 of_gpio 补丁 (已适配新内核), 无需 versionlock (保持最新),
-#  闭源 akmod-nvidia 610 可直接编译.
-install_nvidia_610() {
-    info "方案 B: 最新特性 610 分支 — dnf5 安装 rpmfusion 610 (闭源/最新)..."
-    warn "⚠ 610 为新特性分支(测试性质)! 已知 bug: 随机红色色斑/内屏黑屏/atomic commit 失败"
-    warn "  用户 121 在多发行版实测过 610 色斑问题. 生产力/稳定优先建议用方案 A (595)"
+init_hardware_services() {
+    info "初始化硬件服务 (蓝牙/udev/用户服务持久化)..."
+    systemctl daemon-reload 2>/dev/null || true
 
-    # 编译环境 (610 同样需要 kernel-devel)
-    dnf_ensure akmods dkms 2>/dev/null || true
-    local KVER KDEV
-    KVER=$(uname -r)
-    KDEV=$(rpm -q kernel-devel 2>/dev/null || true)
-    if [[ -z "$KDEV" || "$KDEV" != *"$KVER"* ]]; then
-        info "安装 kernel-devel-$KVER ..."
-        "$DNF" install -y "kernel-devel-$KVER" >/dev/null 2>&1 \
-            || warn "kernel-devel-$KVER 安装失败"
-    fi
-
-    # 安装 610 最新 (不加 --disablerepo, 从 updates 仓库解析最新 610)
-    info "安装 nvidia 610 最新版 (akmod-nvidia 闭源 + 用户空间)..."
-    "$DNF" install -y akmod-nvidia xorg-x11-drv-nvidia xorg-x11-drv-nvidia-cuda \
-        nvidia-settings nvidia-modprobe nvidia-persistenced nvidia-xconfig >/dev/null 2>&1 \
-        || { warn "nvidia 610 安装失败 (检查仓库/网络)"; return 1; }
-
-    # 610 已适配新内核, 直接编译 (无需补丁)
-    if command -v mokutil >/dev/null 2>&1 \
-       && [[ "$(mokutil --sb-state 2>/dev/null)" == *"enabled"* ]]; then
-        warn "⚠ 检测到 Secure Boot 已启用! DKMS 模块需签名才能加载:"
-        warn "  A) BIOS 关闭 Secure Boot (推荐) / B) mokutil --import /var/lib/dkms/mok.pub + 重启 Enroll MOK"
-    fi
-    info "akmods --force 编译内核模块 (约 3-10 分钟)..."
-    if akmods --force 2>&1 | tail -5; then
-        info "✅ akmods 编译完成"
-    else
-        warn "akmods 编译失败, 查看: ls /var/cache/akmods/nvidia*/*.failed.log"
-    fi
-
-    # power 包 + 双服务 (功耗解锁同样适用)
-    "$DNF" install -y xorg-x11-drv-nvidia-power >/dev/null 2>&1 \
-        || warn "xorg-x11-drv-nvidia-power 安装失败 (功耗可能锁 65W)"
-    systemctl enable --now nvidia-powerd >/dev/null 2>&1 || true
-    systemctl enable --now nvidia-persistenced >/dev/null 2>&1 || true
-    info "✅ nvidia-powerd + nvidia-persistenced 已启用"
-}
-
-# ============================================================================
-#  NVIDIA 方案 B 备选: 官方 .run 安装 595.91.07 (open 模块, 生产分支最新)
-# ============================================================================
-install_nvidia_run() {
-    local NV_TARGET="${FF_NV_VERSION:-595.91.07}"
-    info "备选: 官方 .run 安装 $NV_TARGET (open 模块, 生产分支最新)..."
-
-    local NV_URL="${NV_TARGET}/NVIDIA-Linux-x86_64-${NV_TARGET}.run"
-    local NV_RUN="/opt/nvidia/NVIDIA-Linux-x86_64-${NV_TARGET}.run"
-    mkdir -p /opt/nvidia
-
-    # 下载 + sha256 校验
-    if [[ ! -f "$NV_RUN" ]]; then
-        info "下载 NVIDIA $NV_TARGET (官方生产分支, ~400MB)..."
-        curl -fL --retry 3 -o "$NV_RUN" "https://download.nvidia.com/XFree86/Linux-x86_64/${NV_URL}" \
-            || warn "驱动下载失败 (可稍后手动下载)"
-    fi
-    if [[ -f "$NV_RUN" ]]; then
-        local NV_SHA=""
-        NV_SHA=$(curl -fs --max-time 20 "https://download.nvidia.com/XFree86/Linux-x86_64/${NV_TARGET}/NVIDIA-Linux-x86_64-${NV_TARGET}.run.sha256sum" 2>/dev/null | awk '{print $1}' || true)
-        if [[ -n "$NV_SHA" ]] && ! echo "$NV_SHA  $NV_RUN" | sha256sum -c - >/dev/null 2>&1; then
-            warn "⚠ 驱动校验失败, 删除后重新下载"
-            rm -f "$NV_RUN"
+    # 蓝牙: Fedora 装驱动但不保证服务 enable (204 实测: 首次重启蓝牙不加载,
+    #  手动开启一次后正常 — 典型 service 未 enable 症状, 非驱动问题)
+    if command -v bluetoothctl >/dev/null 2>&1; then
+        systemctl enable bluetooth.service >/dev/null 2>&1 || true
+        systemctl start bluetooth.service >/dev/null 2>&1 || true
+        if systemctl is-active bluetooth >/dev/null 2>&1; then
+            info "✅ Bluetooth 服务已启用并运行"
         else
-            info "✅ 驱动文件校验通过"
+            warn "Bluetooth 服务未运行 (可手动: systemctl start bluetooth)"
         fi
+    else
+        info "安装蓝牙组件 (bluez/bluedevil)..."
+        dnf_install_quiet bluez bluez-tools bluedevil || true
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable --now bluetooth.service >/dev/null 2>&1 || true
     fi
 
-    if [[ -f "$NV_RUN" ]]; then
-        # 内核 6.12+ 适配: 595.91.07 已内置 of_gpio compat (官方修复), 无需补丁
-        # --no-x-check: 跳过 X server 检测 (图形会话下 .run 默认 Abort, 121 两次实测失败)
-        info "安装 NVIDIA $NV_TARGET (open 模块 + DKMS + no-x-check)..."
-        if sh "$NV_RUN" --silent --dkms --kernel-module-type=open --no-x-check; then
-            info "✅ NVIDIA $NV_TARGET (open 模块) 安装成功"
+    # udev 规则重载 (首次启动外设/摄像头/输入设备)
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger 2>/dev/null || true
+
+    # 用户服务持久化 (Flatpak portal/用户服务需 linger)
+    if command -v loginctl >/dev/null 2>&1; then
+        if loginctl show-user "$ACTUAL_USER" 2>/dev/null | grep -q 'Linger=yes'; then
+            info "✅ loginctl linger 已启用 ($ACTUAL_USER)"
         else
-            warn "NVIDIA 安装失败, 可手动执行: sudo sh $NV_RUN --dkms --kernel-module-type=open (建议切 tty 或加 --no-x-check)"
+            loginctl enable-linger "$ACTUAL_USER" 2>/dev/null \
+                && info "✅ loginctl linger 已启用 ($ACTUAL_USER, 用户服务开机自启)" \
+                || info "loginctl linger 跳过 (用户会话未初始化, 首次登录后自动生效)"
         fi
     fi
 }
-
-# ============================================================================
-#  CPU 检测 (厂商/核心数/SMT) — 用于诊断报告 + 电源策略决策
-#  按 ChatGPT 建议: CPU 驱动由 Fedora 安装器负责 (amd-ucode/intel-microcode
 #  已含), 脚本只负责"识别厂商 → 用于电源/调度优化", 不重复安装固件.
 # ============================================================================
 detect_cpu() {
@@ -1000,494 +992,111 @@ setup_multimedia() {
 }
 
 # ============================================================================
-#  3/7  CPU/GPU驱动 + 电源方案(默认/auto-cpufreq) + 音视频解码
 # ============================================================================
-optimize_gpu() {
-    step "3/7 CPU/GPU驱动 + 电源方案 + 音视频解码"
-
-    # 模块依赖自检: NVIDIA VA-API 桥接/部分解码包来自 rpmfusion,
-    #  单独执行 -gpu (未跑 -source) 时自动补装, 避免解码器装不上 (幂等)
-    if ! rpm -q rpmfusion-free-release >/dev/null 2>&1; then
-        info "检测到 rpmfusion 未启用 (-gpu 的解码器/驱动包依赖它), 自动安装..."
-        "$DNF" install -y \
-            "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA_VER}.noarch.rpm" \
-            "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${FEDORA_VER}.noarch.rpm" \
-            >/dev/null 2>&1 || warn "rpmfusion 安装失败, 部分解码器/驱动包可能不可用 (建议先执行 -source)"
-    fi
-
-    local GPU_INFO HAS_NVIDIA=0 HAS_AMD=0 HAS_INTEL=0
-    GPU_INFO=$(lspci -nn 2>/dev/null | grep -iE "VGA|3D|Display" || true)
+#  GPU 检测 (ChatGPT 重构: lspci -nnk + PCI class 03xx)
+#  只把 PCI class 0300(VGA)/0302(3D)/0380(Display) 当 GPU,
+#  避免把 8086 网卡/声卡等非显卡设备误判为 Intel GPU.
+# ============================================================================
+detect_gpus() {
+    GPU_INFO=$(lspci -nnk 2>/dev/null | grep -iE 'VGA compatible controller|3D controller|Display controller' || true)
+    HAS_NVIDIA=0; HAS_AMD=0; HAS_INTEL=0
     # 用 lspci -nn 的厂商 ID 检测 (描述文字不可靠: "Corporation" 含 "ati",
     #  会把 Intel/NVIDIA 设备误判成 AMD)
     echo "$GPU_INFO" | grep -qi "\[10de:"           && HAS_NVIDIA=1
     echo "$GPU_INFO" | grep -qiE "\[1002:|\[1022:"  && HAS_AMD=1
     echo "$GPU_INFO" | grep -qi "\[8086:"           && HAS_INTEL=1
-    info "检测: NVIDIA=$HAS_NVIDIA  AMD=$HAS_AMD  Intel=$HAS_INTEL"
+    info "GPU 检测: NVIDIA=$HAS_NVIDIA  AMD=$HAS_AMD  Intel=$HAS_INTEL"
+}
 
-    # CPU 检测 (厂商/核心数/SMT → 诊断报告 + 电源策略上下文)
-    detect_cpu
-
-    # ── nomodeset 清理 (安装器应急参数) ──
-    # Fedora 安装器在独显直连/驱动未装时显示异常会自动加 nomodeset vga=791,
-    # 导致 GPU 内核驱动(KMS)不接管显示, 只有 simple-framebuffer/efifb 工作.
-    # 后果: NVIDIA/amdgpu 驱动装好后也无法正常显示/调亮度/加速.
-    # 处理: 检测到即移除 (这是应急参数不是用户配置), 提示重启后生效.
-    if grep -q "nomodeset" /proc/cmdline 2>/dev/null; then
-        info "⚠ 检测到内核参数 nomodeset (安装器应急参数, 阻止 GPU 驱动接管显示)"
-        info "  移除 nomodeset/vga=791, 重启后 GPU 驱动才能正常 KMS..."
-        grubby --update-kernel=ALL --remove-args="nomodeset vga=791" 2>/dev/null || true
-        info "  已移除, 请重启后重新运行脚本: sudo reboot && sudo bash $0"
-        info "  (验证: cat /proc/cmdline 不再有 nomodeset)"
-        exit 0
-    fi
-
-    # 禁用系统默认电源管理服务 (幂等: 已 masked 则跳过, 避免重复 systemctl 调用)
-    disable_service() {  # disable_service <服务名>
-        local svc="$1"
-        if systemctl is-enabled "$svc" 2>/dev/null | grep -q masked; then
-            return 0
-        fi
-        systemctl stop "$svc" 2>/dev/null || true
-        systemctl disable "$svc" 2>/dev/null || true
-        systemctl mask "$svc.service" 2>/dev/null || true
-    }
-
-    # ── 电源管理方案 ──
-    # 三类场景, 差异化策略 (2026-08 实测优化):
-    #   台式机(无电池)      → 官方默认
-    #   独显本/游戏本(有电池+NVIDIA) → 强制官方, 不装 auto-cpufreq
-    #       (auto-cpufreq 会禁用 power-profiles-daemon, 实测导致 EC 性能模式
-    #        功能键失效/功耗链路异常 — 苍龙16 实测)
-    #   轻薄本/核显本(有电池+无独显) → 询问是否尝试 auto-cpufreq
-    if [[ "$POWER_MODE" == "ask" ]]; then
-        if compgen -G "/sys/class/power_supply/BAT*" >/dev/null 2>&1; then
-            if [[ "$HAS_NVIDIA" -eq 1 ]]; then
-                info "检测到独显本 (NVIDIA + 电池), 使用官方电源管理 (power-profiles-daemon)"
-                info "  auto-cpufreq 会禁用 power-profiles-daemon, 实测影响 EC 性能模式键/功耗链路, 独显本不推荐安装"
-                POWER_MODE="default"
-            else
-                echo ""
-                echo -e "  ${CYAN}电源管理方案${NC} (检测到轻薄本/核显本, 有电池):"
-                echo "    1) 系统默认 (tuned 或 power-profiles-daemon, 按已装为准)  [官方默认, 回车直接选]"
-                echo "    2) auto-cpufreq (自动调频优化, 轻薄本可尝试)"
-                read -r -p "  请选择 [1/2]: " POWER_CHOICE
-                POWER_MODE="default"
-                [[ "$POWER_CHOICE" == "2" ]] && POWER_MODE="auto"
-            fi
-        else
-            info "检测到台式机 (无电池), 使用系统默认电源管理 (官方)"
-            POWER_MODE="default"
-        fi
-    fi
-
-    if [[ "$POWER_MODE" == "default" ]]; then
-        # Fedora 44 全新安装默认电源管理是 tuned (balanced-battery profile),
-        # power-profiles-daemon 是可选包. 智能选择:
-        #   PPD 已安装 → 启用 PPD (官方推荐, KDE 电源滑块用)
-        #   PPD 未安装 → 保留 tuned (Fedora 默认, 已在跑则不动)
-        if rpm -q power-profiles-daemon >/dev/null 2>&1; then
-            info "电源方案: 系统默认 (power-profiles-daemon + amd-pstate EPP)"
-            systemctl unmask power-profiles-daemon 2>/dev/null || true
-            systemctl enable --now power-profiles-daemon 2>/dev/null || true
-            systemctl enable tuned 2>/dev/null || true
-            info "日常切换: powerprofilesctl set power-saver|balanced|performance"
-        else
-            info "电源方案: Fedora 默认 (tuned, balanced-battery profile)"
-            info "  power-profiles-daemon 未安装, 保留 tuned 电源管理 (KDE 亮度/电源正常)"
-            systemctl enable --now tuned 2>/dev/null || true
-            tuned-adm active 2>/dev/null || true
-            info "如需 PPD (powerprofilesctl 命令): sudo dnf install power-profiles-daemon && sudo systemctl enable --now power-profiles-daemon"
-        fi
-        # AMD 硬件协调电源管理 (Zen4+/9955HX)
-        if [[ -d /sys/devices/system/cpu/amd_pstate ]] \
-           && [[ "$(cat /sys/devices/system/cpu/amd_pstate/status 2>/dev/null)" != "active" ]]; then
-            grubby --update-kernel=ALL --args="amd_pstate=active" 2>/dev/null || true
-            info "已添加内核参数 amd_pstate=active (重启后生效)"
-        fi
+# ============================================================================
+#  AMD GPU 栈 — Fedora 原生 amdgpu + Mesa (ChatGPT 重构)
+#  只补缺失的用户空间组件 (Vulkan/VA-API), 不装任何 proprietary 驱动.
+#  保留: 亮度 100% 变暗修复 (121 实测验证的特定硬件 workaround, 条件式).
+# ============================================================================
+install_amd_gpu_stack() {
+    # 内核驱动: lspci -k 确认已在用 amdgpu (Fedora 默认, 无需安装)
+    local AMD_DRV=""
+    AMD_DRV=$(lspci -k 2>/dev/null | grep -A3 "\[1002:\|\[1022:" | grep -oP 'Kernel driver in use: \K.*' | head -1)
+    if [[ -n "$AMD_DRV" ]]; then
+        info "✅ AMD GPU 内核驱动已就绪: $AMD_DRV (Fedora 内置, 跳过)"
+    elif modinfo -F name amdgpu >/dev/null 2>&1; then
+        info "✅ AMD GPU 内核驱动已就绪: amdgpu (跳过)"
     else
-        info "电源方案: auto-cpufreq (禁用系统默认电源服务)"
-        # power-profiles-daemon (与 auto-cpufreq 冲突)
-        disable_service power-profiles-daemon
-        # TLP
-        disable_service tlp
-        disable_service tlp-sleep
-        # tuned (Fedora 自带)
-        disable_service tuned
+        info "安装 AMD Mesa 基础驱动..."
+        dnf_install_quiet mesa-dri-drivers || true
+    fi
 
-        # auto-cpufreq 仅对笔记本(有电池)有意义; 台式机收益低且可能与电源策略冲突
-        if ! compgen -G "/sys/class/power_supply/BAT*" >/dev/null 2>&1; then
-            info "检测到台式机 (无电池), 跳过 auto-cpufreq 安装"
-        else
-    info "安装 auto-cpufreq 依赖..."
-    dnf_install_quiet python3-pip python3-devel python3-psutil python3-dbus \
-        python3-gi gobject-introspection gobject-introspection-devel \
-        gtk3-devel python3-cairo cairo-devel gcc dmidecode git || true
-
-    # 安装 auto-cpufreq (非交互式, 不再调用会卡住的官方 yum 安装器)
-    local AUTO_CPUFREQ_DIR="/opt/auto-cpufreq"
-    if [[ -d "${AUTO_CPUFREQ_DIR}/.git" ]]; then
-        info "auto-cpufreq 已存在, 跳过克隆"
+    # 只补缺失: Vulkan 用户空间 (vulkaninfo 缺失才装)
+    if command -v vulkaninfo >/dev/null 2>&1; then
+        info "✅ Vulkan 已就绪 ($(vulkaninfo --summary 2>/dev/null | grep -oP 'deviceName\s+=\s+\K.*' | head -1 || echo OK))"
     else
-        info "克隆 auto-cpufreq 仓库..."
-        rm -rf "$AUTO_CPUFREQ_DIR"
-        gh_clone "AdnanHodzic/auto-cpufreq" "$AUTO_CPUFREQ_DIR" || \
-            warn "auto-cpufreq 克隆失败"
+        info "安装 Vulkan 用户空间 (vulkaninfo 缺失)..."
+        dnf_install_quiet mesa-vulkan-drivers mesa-vulkan-drivers.i686 vulkan-radeon vulkan-tools || true
     fi
 
-    if [[ -d "$AUTO_CPUFREQ_DIR" ]]; then
-        local VENV="${AUTO_CPUFREQ_DIR}/venv"
-        # 幂等: venv 与命令已就绪时跳过 venv 创建/pip 安装 (避免每次重复构建)
-        if [[ ! -x "$VENV/bin/auto-cpufreq" ]]; then
-            info "创建虚拟环境并安装 auto-cpufreq (非交互式, 使用 TUNA PyPI 镜像)..."
-            # venv 依赖: Fedora 的 python3 -m venv 需要 python3-venv 包, 缺失时 venv 创建
-            #  静默失败 (stderr 被吞) → pip 全部失败且日志无真因, 先确保依赖
-            dnf_ensure python3-venv 2>/dev/null || true
-            # 国内网络加速: pip 走清华镜像
-            export PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
-            python3 -m venv --system-site-packages "$VENV" 2>/dev/null
-            "$VENV/bin/pip" install --upgrade pip wheel 2>/dev/null
-            if ( cd "$AUTO_CPUFREQ_DIR" && timeout 1500 "$VENV/bin/pip" install . >/dev/null 2>&1 ); then
-                info "✅ auto-cpufreq 安装完成: ${VENV}/bin/auto-cpufreq"
-            else
-                warn "auto-cpufreq 安装失败/超时, 请手动检查网络或 PyPI 镜像"
-            fi
-        else
-            info "✅ auto-cpufreq 已安装 (跳过 pip 安装): ${VENV}/bin/auto-cpufreq"
-        fi
-
-        # 安装为系统服务
-        #  (官方 --install 在 venv 安装下会因缺少 /usr/local/share/auto-cpufreq/scripts
-        #  而崩溃且不创建服务单元, 故手动部署)
-        # 幂等: 服务已 active 时跳过整个服务配置段 (二次执行秒过)
-        if systemctl is-active auto-cpufreq >/dev/null 2>&1; then
-            info "✅ auto-cpufreq 服务运行中 (跳过服务配置)"
-        elif command -v "$VENV/bin/auto-cpufreq" >/dev/null 2>&1; then
-            mkdir -p /usr/local/share/auto-cpufreq/scripts 2>/dev/null || true
-            cp -r "${AUTO_CPUFREQ_DIR}/scripts/." /usr/local/share/auto-cpufreq/scripts/ 2>/dev/null || true
-            cat > /etc/systemd/system/auto-cpufreq.service << EOF
-[Unit]
-Description=auto-cpufreq - Automatic CPU speed & power optimizer
-After=multi-user.target
-
-[Service]
-Type=simple
-ExecStart=${VENV}/bin/auto-cpufreq --daemon
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-            systemctl daemon-reload 2>/dev/null || true
-            systemctl enable auto-cpufreq >/dev/null 2>&1 || true
-            systemctl start auto-cpufreq 2>/dev/null || true
-            sleep 2
-            if systemctl is-active auto-cpufreq >/dev/null 2>&1; then
-                info "✅ auto-cpufreq 已安装并启用"
-
-                # PATH 链接: 官方安装器不建 /usr/bin 链接, 用户终端才能直接敲 auto-cpufreq
-                if [[ ! -e /usr/local/bin/auto-cpufreq ]]; then
-                    ln -sf "$VENV/bin/auto-cpufreq" /usr/local/bin/auto-cpufreq 2>/dev/null || true
-                fi
-
-                # 回退官方方案脚本: 停用 auto-cpufreq, 恢复系统默认电源管理
-                mkdir -p "${ACTUAL_HOME}/.local/scripts" 2>/dev/null || true
-                if [[ -d "${ACTUAL_HOME}/.local/scripts" ]]; then
-                    cat > "${ACTUAL_HOME}/.local/scripts/power-official.sh" <<'EOF'
-#!/bin/bash
-# 回退到系统官方电源管理 (停用 auto-cpufreq, 恢复 PPD 或 tuned)
-set -e
-echo "==> 停用 auto-cpufreq 服务..."
-sudo systemctl stop auto-cpufreq 2>/dev/null || true
-sudo systemctl disable auto-cpufreq 2>/dev/null || true
-sudo systemctl mask auto-cpufreq 2>/dev/null || true
-echo "==> 恢复官方电源服务..."
-# PPD 装了则启用 (KDE 电源滑块用); 否则保留 tuned (Fedora 44 默认)
-sudo systemctl unmask tuned 2>/dev/null || true
-sudo systemctl enable --now tuned 2>/dev/null || true
-if rpm -q power-profiles-daemon >/dev/null 2>&1; then
-    sudo systemctl unmask power-profiles-daemon 2>/dev/null || true
-    sudo systemctl enable --now power-profiles-daemon 2>/dev/null || true
-    echo "==> 完成! 当前为官方电源方案 (powerprofilesctl status 查看)"
-else
-    echo "==> 完成! 当前为官方电源方案 (tuned: $(tuned-adm active 2>/dev/null || echo running))"
-fi
-EOF
-                    chmod +x "${ACTUAL_HOME}/.local/scripts/power-official.sh"
-                    chown "$ACTUAL_USER" "${ACTUAL_HOME}/.local/scripts/power-official.sh" 2>/dev/null || true
-                    info "✅ 回退官方方案脚本: ${ACTUAL_HOME}/.local/scripts/power-official.sh (随时可运行回退)"
-                fi
-
-                info "auto-cpufreq 状态:"
-                # 注意: daemon 持锁时 `--stats` 会挂起, 直接读 stats 文件更稳
-                tail -n 5 /var/run/auto-cpufreq.stats 2>/dev/null || true
-                info "日常查看状态: systemctl status auto-cpufreq; 实时数据: tail -f /var/run/auto-cpufreq.stats"
-            else
-                warn "auto-cpufreq 服务未运行, 可手动检查: systemctl status auto-cpufreq"
-            fi
-        else
-            warn "auto-cpufreq 命令不可用, 请手动安装"
-        fi
-    fi
-    fi
-    fi
-
-    # ── 音视频解码 (独立函数 setup_multimedia: ffmpeg 替换 + gstreamer + OpenH264) ──
-    setup_multimedia
-
-    # ── NVIDIA: 官方生产分支 (595.x) + open 内核模块 ──
-    #  610.x = 新特性分支(测试版): 有显示管线回归 (color_pipeline 色斑/内屏黑屏/atomic commit 失败)
-    #  595.x = 生产稳定分支; Blackwell (RTX 50) 必须用 open 内核模块 (-M=open)
-    if [[ "$HAS_NVIDIA" -eq 1 ]]; then
-        local NV_VER NV_TARGET NV_URL NV_RUN NV_SHA
-        NV_VER=$(modinfo -F version nvidia 2>/dev/null || true)
-
-        # ── 固定使用已验证的稳定版 ──
-        #  610 新特性分支 bug 太多 (色斑/内屏黑屏/atomic commit 失败/Chrome 崩溃)
-        #  595 生产分支稳定; rpmfusion 实测稳定版为 595.58.03 (内核 6.12+ 需打 of_gpio 补丁),
-        #  官方 .run 最新生产版 595.91.07 (已内置 of_gpio compat). 换版本: FF_NV_VERSION=595.xx
-        NV_TARGET="${FF_NV_VERSION:-595.58.03}"
-        if [[ "$NV_TARGET" == 610.* ]]; then
-            warn "⚠ FF_NV_VERSION=610.x 为新特性分支(测试版), 已知 bug: 色斑/内屏黑屏/atomic commit 失败!"
-        fi
-        NV_URL="${NV_TARGET}/NVIDIA-Linux-x86_64-${NV_TARGET}.run"
-        NV_RUN="/opt/nvidia/NVIDIA-Linux-x86_64-${NV_TARGET}.run"
-
-        # 已装 595.x 生产分支 (open 模块) 即跳过 — 不要求版本号完全相等,
-        #  兼容 rpmfusion dnf 装的 595.58.03 与官方 .run 的 595.80/595.91.07.
-        #  (旧逻辑只认精确版本, 会把 rpmfusion 595.58.03 误判为"旧驱动"卸载重装 .run,
-        #   121 2026-08 实测该 bug 会毁掉已配好的 dnf 版)
-        if [[ -n "$NV_VER" && "$NV_VER" == 595.* ]]; then
-            info "✅ NVIDIA 驱动已装 (生产分支 $NV_VER, open 模块), 跳过安装"
-        elif [[ -n "$NV_VER" && "$NV_VER" == 610.* ]]; then
-            # 已装 610 (可能之前手动装的) — 询问是否降级 595 或保留
-            info "检测到已装 610 分支驱动 ($NV_VER)"
-            local NV_SKIP=0
-            if [[ "${FF_NV_SKIP:-0}" != "1" ]]; then
-                echo ""
-                echo -e "  ${CYAN}检测到 NVIDIA 610 分支驱动 (新特性分支, 有色斑风险)${NC}"
-                echo "    1) 卸载 610, 改装生产稳定 595  [推荐, 回车默认]"
-                echo "    2) 保留 610 不动"
-                read -r -p "  请选择 [1/2]: " NV_CHOICE
-                [[ "$NV_CHOICE" == "2" ]] && NV_SKIP=1
-            fi
-            if [[ "$NV_SKIP" -eq 1 ]]; then
-                info "保留 610 驱动 (注意色斑风险)"
-            else
-                warn "卸载 610 分支驱动..."
-                "$DNF" remove -y akmod-nvidia xorg-x11-drv-nvidia xorg-x11-drv-nvidia-cuda \
-                    xorg-x11-drv-nvidia-cuda-libs xorg-x11-drv-nvidia-libs \
-                    xorg-x11-drv-nvidia-power nvidia-settings kmod-nvidia \
-                    nvidia-modprobe nvidia-persistenced libva-nvidia-driver 2>/dev/null || true
-                NV_VER=""
-            fi
-        fi
-
-        if [[ -z "$NV_VER" ]]; then
-            # 未装官方驱动 → 二选一: 生产稳定 595 (默认) / 最新特性 610
-            local NV_SKIP=0
-            if [[ "${FF_NV_SKIP:-0}" != "1" ]]; then
-                echo ""
-                echo -e "  ${CYAN}检测到 NVIDIA 独显 (官方驱动未安装)${NC}"
-                echo "    请选择驱动分支:"
-                echo "    1) 生产稳定 595.x (open 模块, rpmfusion dnf5 安装)  [推荐, 回车默认]"
-                echo "    2) 最新特性 610.x (dnf5 安装, 已知色斑 bug 风险)"
-                echo "    3) 跳过 (仅用核显 / 开源 nouveau)"
-                read -r -p "  请选择 [1/2/3]: " NV_CHOICE
-                case "${NV_CHOICE:-1}" in
-                    2)  NV_SKIP=2 ;;
-                    3)  NV_SKIP=1 ;;
-                    *)  NV_SKIP=0 ;;
-                esac
-            fi
-            if [[ "$NV_SKIP" -eq 1 ]]; then
-                info "已跳过 NVIDIA 驱动安装 (核显/nouveau 模式)"
-            elif [[ "$NV_SKIP" -eq 2 ]]; then
-                # 方案 B: 最新特性 610
-                if [[ -n "${FF_NV_VERSION:-}" && "${FF_NV_VERSION}" == 610.* ]]; then
-                    info "FF_NV_VERSION 指定 610, 直接安装..."
-                    install_nvidia_610
-                else
-                    install_nvidia_610
-                fi
-            else
-                # 方案 A (默认): 生产稳定 595
-                install_nvidia_595
-            fi
-        fi
-
-        # ── NVIDIA 配置 (幂等, 每次执行) ──
-        # modeset=1: Wayland/KMS 必需 (.run 安装器不生成此文件!)
-        cat > /etc/modprobe.d/nvidia.conf <<'EOF'
-options nvidia_drm modeset=1 fbdev=1
-EOF
-        # nouveau 黑名单 (防 nouveau 抢先绑定 GPU)
-        if [[ ! -f /etc/modprobe.d/blacklist-nouveau.conf ]]; then
-            cat > /etc/modprobe.d/blacklist-nouveau.conf <<'EOF'
-blacklist nouveau
-options nouveau modeset=0
-EOF
-        fi
-        # dracut 强制加载 nvidia 模块
-        echo 'force_drivers+=" nvidia nvidia_modeset nvidia_uvm nvidia_drm "' > /etc/dracut.conf.d/90-gpu.conf
-        # VA-API 视频硬解桥接
-        dnf_install_quiet libva-nvidia-driver vdpauinfo || true
-        # Dynamic Boost 守护进程 (.run 自带 nvidia-powerd, 服务默认 disabled)
-        #  启用后 GPU 功耗墙可随负载动态调整 (配合 EC 性能模式). 注意: Blackwell
-        #  笔记本在 Open 模块 NPCF 绑定缺陷修复前 (issue #1162), nvidia-powerd 可能
-        #  静默运行 — 启用无害, 修复后自动生效, 不要因静默而禁用.
-        if command -v nvidia-powerd >/dev/null 2>&1; then
-            systemctl enable nvidia-powerd >/dev/null 2>&1 || true
-            systemctl start nvidia-powerd >/dev/null 2>&1 || true
-            if systemctl is-active nvidia-powerd >/dev/null 2>&1; then
-                info "✅ nvidia-powerd (Dynamic Boost) 已启用"
-            else
-                info "nvidia-powerd 已安装 (服务未运行; Blackwell 缺陷 #1162 修复前属正常)"
-            fi
-        else
-            info "nvidia-powerd 未随驱动安装 (Dynamic Boost 不可用, 不影响基础功能)"
-        fi
-        info "✅ NVIDIA 配置完成 (modeset=1 + nouveau 黑名单 + nvidia-powerd)"
-    fi
-
-    # ── AMD: 检测补齐模式 (Fedora 已内置 amdgpu/mesa, 只补缺失的用户空间组件) ──
-    if [[ "$HAS_AMD" -eq 1 ]]; then
-        # 内核驱动: lspci -k 确认已在用 amdgpu (Fedora 默认, 无需安装)
-        local AMD_DRV=""
-        AMD_DRV=$(lspci -k 2>/dev/null | grep -A3 "\[1002:\|\[1022:" | grep -oP 'Kernel driver in use: \K.*' | head -1)
-        if [[ -n "$AMD_DRV" ]]; then
-            info "✅ AMD GPU 内核驱动已就绪: $AMD_DRV (Fedora 内置, 跳过)"
-        elif modinfo -F name amdgpu >/dev/null 2>&1; then
-            info "✅ AMD GPU 内核驱动已就绪: amdgpu (跳过)"
-        else
-            info "安装 AMD Mesa 基础驱动..."
-            dnf_install_quiet mesa-dri-drivers || true
-        fi
-
-        # 只补缺失: Vulkan 用户空间 (vulkaninfo 缺失才装)
-        if command -v vulkaninfo >/dev/null 2>&1; then
-            info "✅ Vulkan 已就绪 ($(vulkaninfo --summary 2>/dev/null | grep -oP 'deviceName\s+=\s+\K.*' | head -1 || echo OK))"
-        else
-            info "安装 Vulkan 用户空间 (vulkaninfo 缺失)..."
-            dnf_install_quiet mesa-vulkan-drivers mesa-vulkan-drivers.i686 vulkan-radeon vulkan-tools || true
-        fi
-
-        # 只补缺失: VA-API 硬解 (vainfo 缺失才装; 这是 Fedora 默认可能缺的部分)
-        if command -v vainfo >/dev/null 2>&1; then
-            info "✅ VA-API 已就绪"
-        else
-            info "安装 VA-API 硬解组件 (vainfo 缺失)..."
-            dnf_install_quiet libva libva-utils mesa-va-drivers mesa-vdpau-drivers || true
-            # rpmfusion free 的 mesa-va-drivers 因法律原因不含 H.264/H.265 解码,
-            #   freeworld 版补全 (AMD 硬解完整; .i686 供 32 位应用)
-            dnf_install_quiet mesa-va-drivers-freeworld mesa-va-drivers-freeworld.i686 || true
-        fi
-
-        # ── 亮度 100% 反而变暗修复 (2026-08 联想 780M 实测) ──
-        # 根因: 内核 7.x amdgpu 新特性 "custom brightness curve" (从面板固件读亮度
-        #       曲线做非线性映射), 部分面板 (如 CSOT T3) 曲线在 100% 处映射异常,
-        #       导致 100% 亮度反而比 98% 暗.
-        # 修复: 内核参数 amdgpu.dcdebugmask=0x40000 (DC_DISABLE_CUSTOM_BRIGHTNESS_CURVE,
-        #       枚举值实查自 amd_shared.h). 幂等: 已设置则跳过.
-        local HAS_CURVE_BUG=0
-        if ls /sys/class/backlight/amdgpu_bl* >/dev/null 2>&1 \
-           && dmesg 2>/dev/null | grep -q "Using custom brightness curve"; then
-            HAS_CURVE_BUG=1
-        fi
-        if [[ "$HAS_CURVE_BUG" -eq 1 ]]; then
-            local DC_MASK="$(cat /sys/module/amdgpu/parameters/dcdebugmask 2>/dev/null || echo 0)"
-            if [[ "$DC_MASK" != "0" && "$DC_MASK" != "0x0" && "$DC_MASK" != "0x00000" ]]; then
-                info "✅ amdgpu dcdebugmask 已设置 ($DC_MASK), 跳过"
-            else
-                info "⚠ 检测到 amdgpu custom brightness curve (100% 亮度可能变暗)"
-                info "  添加内核参数 amdgpu.dcdebugmask=0x40000 (禁用曲线, 需重启生效)..."
-                grubby --update-kernel=ALL --args="amdgpu.dcdebugmask=0x40000" 2>/dev/null || true
-                info "  已添加 (重启后验证: cat /sys/module/amdgpu/parameters/dcdebugmask)"
-            fi
-        fi
-
-        if [[ -f /etc/dracut.conf.d/90-gpu.conf ]]; then
-            sed -i 's/= " nvidia nvidia_modeset/= " nvidia nvidia_modeset amdgpu/' /etc/dracut.conf.d/90-gpu.conf
-        else
-            echo 'force_drivers+=" amdgpu "' > /etc/dracut.conf.d/90-gpu.conf
-        fi
-    fi
-
-    # ── Intel 核显 ──
-    if [[ "$HAS_INTEL" -eq 1 ]]; then
-        if modinfo -F name i915 >/dev/null 2>&1; then
-            info "✅ Intel 核显驱动已就绪: i915 (跳过安装)"
-        else
-            info "安装 Intel 核显驱动 (Mesa + Vulkan)..."
-            dnf_install_quiet mesa-dri-drivers mesa-vulkan-drivers \
-                mesa-vulkan-drivers.i686 || true
-        fi
-        # VA-API 硬解 (Intel QSV)
-        dnf_install_quiet intel-media-driver || true
-    fi
-
-    # ── 硬件服务初始化 (首次启动可靠性) ──
-    # 蓝牙: Fedora 装驱动但不保证服务 enable (204 实测: 首次重启蓝牙不加载,
-    #  手动开启一次后正常 — 典型 service 未 enable 症状, 非驱动问题)
-    info "初始化硬件服务 (蓝牙/udev)..."
-    systemctl daemon-reload 2>/dev/null || true
-    if command -v bluetoothctl >/dev/null 2>&1; then
-        systemctl enable bluetooth.service >/dev/null 2>&1 || true
-        systemctl start bluetooth.service >/dev/null 2>&1 || true
-        if systemctl is-active bluetooth >/dev/null 2>&1; then
-            info "✅ Bluetooth 服务已启用并运行"
-        else
-            warn "Bluetooth 服务未运行 (可手动: systemctl start bluetooth)"
-        fi
+    # 只补缺失: VA-API 硬解 (vainfo 缺失才装; 这是 Fedora 默认可能缺的部分)
+    if command -v vainfo >/dev/null 2>&1; then
+        info "✅ VA-API 已就绪"
     else
-        info "安装蓝牙组件 (bluez/bluedevil)..."
-        dnf_install_quiet bluez bluez-tools bluedevil || true
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl enable --now bluetooth.service >/dev/null 2>&1 || true
+        info "安装 VA-API 硬解组件 (vainfo 缺失)..."
+        dnf_install_quiet libva libva-utils mesa-va-drivers mesa-vdpau-drivers || true
+        # rpmfusion free 的 mesa-va-drivers 因法律原因不含 H.264/H.265 解码,
+        #   freeworld 版补全 (AMD 硬解完整; .i686 供 32 位应用)
+        dnf_install_quiet mesa-va-drivers-freeworld mesa-va-drivers-freeworld.i686 || true
     fi
-    # udev 规则重载 (避免首次启动外设/摄像头/输入设备异常)
-    udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger 2>/dev/null || true
 
-    # 用户服务持久化 (ChatGPT 建议: Flatpak portal/用户服务需 linger)
-    #  失败不显示 ERROR — 用户会话未初始化时正常 (首次登录后自动激活)
-    if command -v loginctl >/dev/null 2>&1; then
-        if loginctl show-user "$ACTUAL_USER" 2>/dev/null | grep -q 'Linger=yes'; then
-            info "✅ loginctl linger 已启用 ($ACTUAL_USER)"
+    # ── 亮度 100% 反而变暗修复 (2026-08 联想 780M 实测) ──
+    # 根因: 内核 7.x amdgpu 新特性 "custom brightness curve" (从面板固件读亮度
+    #       曲线做非线性映射), 部分面板 (如 CSOT T3) 曲线在 100% 处映射异常,
+    #       导致 100% 亮度反而比 98% 暗.
+    # 修复: 内核参数 amdgpu.dcdebugmask=0x40000 (DC_DISABLE_CUSTOM_BRIGHTNESS_CURVE,
+    #       枚举值实查自 amd_shared.h). 幂等: 已设置则跳过.
+    #       保留依据: 已验证硬件问题的特定条件 workaround (ChatGPT 认可此类).
+    local HAS_CURVE_BUG=0
+    if ls /sys/class/backlight/amdgpu_bl* >/dev/null 2>&1 \
+       && dmesg 2>/dev/null | grep -q "Using custom brightness curve"; then
+        HAS_CURVE_BUG=1
+    fi
+    if [[ "$HAS_CURVE_BUG" -eq 1 ]]; then
+        local DC_MASK="$(cat /sys/module/amdgpu/parameters/dcdebugmask 2>/dev/null || echo 0)"
+        if [[ "$DC_MASK" != "0" && "$DC_MASK" != "0x0" && "$DC_MASK" != "0x00000" ]]; then
+            info "✅ amdgpu dcdebugmask 已设置 ($DC_MASK), 跳过"
         else
-            loginctl enable-linger "$ACTUAL_USER" 2>/dev/null \
-                && info "✅ loginctl linger 已启用 ($ACTUAL_USER, 用户服务开机自启)" \
-                || info "loginctl linger 跳过 (用户会话未初始化, 首次登录后自动生效)"
+            info "⚠ 检测到 amdgpu custom brightness curve (100% 亮度可能变暗)"
+            info "  添加内核参数 amdgpu.dcdebugmask=0x40000 (禁用曲线, 需重启生效)..."
+            grubby --update-kernel=ALL --args="amdgpu.dcdebugmask=0x40000" 2>/dev/null || true
+            info "  已添加 (重启后验证: cat /sys/module/amdgpu/parameters/dcdebugmask)"
         fi
     fi
+}
 
-    # 清理本机用不到的 GPU 专属包 (按检测到的硬件精确清理, 避免误删)
-    if [[ "$HAS_NVIDIA" -eq 0 ]]; then
-        for pkg in nvidia-gpu-firmware xorg-x11-drv-nvidia-libs; do
-            if rpm -q "$pkg" >/dev/null 2>&1; then
-                info "清理无用包: $pkg (非本机 GPU 所需)..."
-                "$DNF" remove -y "$pkg" >/dev/null 2>&1 || true
-            fi
-        done
+# ============================================================================
+#  Intel GPU 栈 — Fedora 原生 i915 + Mesa (ChatGPT 重构)
+# ============================================================================
+install_intel_gpu_stack() {
+    if modinfo -F name i915 >/dev/null 2>&1; then
+        info "✅ Intel 核显驱动已就绪: i915 (跳过安装)"
+    else
+        info "安装 Intel 核显驱动 (Mesa + Vulkan)..."
+        dnf_install_quiet mesa-dri-drivers mesa-vulkan-drivers \
+            mesa-vulkan-drivers.i686 || true
     fi
-    if [[ "$HAS_INTEL" -eq 0 ]]; then
-        if rpm -q libva-intel-media-driver >/dev/null 2>&1; then
-            info "清理无用包: libva-intel-media-driver (无 Intel 核显)..."
-            "$DNF" remove -y libva-intel-media-driver >/dev/null 2>&1 || true
-        fi
-    fi
+    # VA-API 硬解 (Intel QSV)
+    dnf_install_quiet intel-media-driver libva libva-utils || true
+}
 
-    # 幂等: dracut 仅当配置变更时重建 (90-gpu.conf 时间戳晚于 initramfs 才触发)
-    if [[ -f /etc/dracut.conf.d/90-gpu.conf ]] \
-       && [[ "/etc/dracut.conf.d/90-gpu.conf" -nt "/boot/initramfs-$(uname -r).img" ]]; then
-        dracut --force 2>/dev/null || true
-    fi
-
-    # ── GPU 诊断报告 (不静默, 一眼看清检测/补齐结果) ──
+# ============================================================================
+#  GPU/CPU 验证报告 (ChatGPT 重构: 不静默, 失败必须报告)
+# ============================================================================
+verify_gpu() {
     echo ""
-    echo -e "  ${CYAN}GPU 检测报告:${NC}"
+    echo -e "  ${CYAN}GPU / CPU 状态报告:${NC}"
     echo "  ──────────────────────────────────"
     echo "  CPU: $(lscpu 2>/dev/null | grep -m1 'Model name' | sed 's/Model name:[[:space:]]*//')"
     echo "       厂商: ${CPU_VENDOR:-未知} | 核心: ${CPU_CORES:-?} | SMT: ${CPU_SMT:-?}"
+    echo "       scaling driver: ${SCALING_DRIVER:-未知}"
+    command -v powerprofilesctl >/dev/null 2>&1 \
+        && echo "       电源模式: $(powerprofilesctl get 2>/dev/null || echo unknown)"
     echo "  ──────────────────────────────────"
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
@@ -1499,15 +1108,12 @@ EOF
     done <<< "$GPU_INFO"
     echo "  ──────────────────────────────────"
     # 显示输出归属检测: 独显直连 vs 混合模式 (PRIME/Optimus)
-    #  方法: /sys/class/drm/card*-<接口>/status 看哪个 card 有 connected 输出,
-    #  再查该 card 的 PCI vendor (10de=NVIDIA → 独显直连; 否则核显输出=混合模式)
     local DISPLAY_MODE="未知" NVIDIA_CARD="" CARD_VENDOR=""
     NVIDIA_CARD=$(ls /sys/class/drm/ 2>/dev/null | grep -oE '^card[0-9]+' | sort -u | while read -r c; do
         v=$(cat "/sys/class/drm/$c/device/vendor" 2>/dev/null || true)
         [[ "$v" == "0x10de" ]] && echo "$c" && break
     done | head -1)
     if [[ -n "$NVIDIA_CARD" ]]; then
-        # NVIDIA card 上是否有 connected 输出 (独显直连) 还是全靠核显输出 (混合模式)
         local NV_CONNECTED=0
         for conn in /sys/class/drm/${NVIDIA_CARD}-*/status; do
             [[ -f "$conn" ]] || continue
@@ -1529,15 +1135,99 @@ EOF
     command -v vainfo >/dev/null 2>&1 && echo "  VA-API: ✓" || echo "  VA-API: ✗ 缺失"
     rpm -q ffmpeg >/dev/null 2>&1 && echo "  FFmpeg: ✓ (rpmfusion 完整版)" || echo "  FFmpeg: ✗ 缺失"
     rpm -q gstreamer1-libav >/dev/null 2>&1 && echo "  GStreamer: ✓ (含 libav 解码)" || echo "  GStreamer: ✗ 缺 libav"
+    if [[ "$HAS_NVIDIA" -eq 1 ]]; then
+        local NV_MOD=""
+        NV_MOD=$(modinfo -F version nvidia 2>/dev/null || true)
+        if [[ -n "$NV_MOD" ]]; then
+            echo "  NVIDIA module: ✓ $NV_MOD"
+            command -v nvidia-smi >/dev/null 2>&1 \
+                && echo "  nvidia-smi: ✓" || echo "  nvidia-smi: ✗ 缺失"
+        else
+            echo "  NVIDIA module: ⚠ 未构建/未找到 (见上方警告)"
+        fi
+    fi
     echo "  ──────────────────────────────────"
     # 混合模式提示 (Chromium/Electron 在混合模式 Wayland 下强制走核显, 属正常)
     if [[ "$DISPLAY_MODE" == *"混合模式"* ]] && command -v google-chrome >/dev/null 2>&1; then
         info "提示: 混合模式下 Chrome/Electron 会使用核显渲染 (正常行为), 硬解走核显 VA-API"
     fi
-
-    info "✅ GPU + auto-cpufreq + 解码 配置完成"
 }
 
+# ============================================================================
+#  3/7  CPU/GPU 驱动 + Fedora 原生电源管理 + 音视频解码 (ChatGPT 重构)
+#  结构: detect_cpu → configure_power_management → detect_gpus
+#        → NVIDIA(akmod+验证) / AMD(amdgpu+Mesa) / Intel(i915+Mesa)
+#        → setup_multimedia → verify_gpu
+# ============================================================================
+optimize_gpu() {
+    step "3/7 CPU/GPU 驱动 + Fedora 原生电源管理 + 音视频解码"
+
+    # 模块依赖自检: NVIDIA/解码包来自 rpmfusion,
+    #  单独执行 -gpu (未跑 -source) 时自动补装 (幂等)
+    if ! rpm -q rpmfusion-free-release >/dev/null 2>&1 || \
+       ! rpm -q rpmfusion-nonfree-release >/dev/null 2>&1; then
+        info "检测到 rpmfusion 未完整启用 (驱动/解码器依赖它), 自动安装 free + nonfree..."
+        "$DNF" install -y \
+            "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA_VER}.noarch.rpm" \
+            "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${FEDORA_VER}.noarch.rpm" \
+            >/dev/null 2>&1 || warn "rpmfusion 安装失败, 部分驱动/解码器可能不可用 (建议先执行 -source)"
+    fi
+
+    # ── CPU 检测 + Fedora 原生电源管理 ──
+    detect_cpu
+    configure_power_management
+
+    # ── GPU 硬件检测 (PCI class 03xx + 厂商 ID) ──
+    detect_gpus
+    if [[ -z "$GPU_INFO" ]]; then
+        warn "没有检测到 VGA/3D/Display 控制器"
+        warn "跳过 GPU 驱动安装, 仅装通用媒体解码栈"
+        setup_multimedia
+        return 0
+    fi
+
+    # ── nomodeset 清理 (安装器应急参数) ──
+    # Fedora 安装器在独显直连/驱动未装时显示异常会自动加 nomodeset vga=791,
+    # 导致 GPU 内核驱动(KMS)不接管显示, 只有 simple-framebuffer/efifb 工作.
+    # 后果: NVIDIA/amdgpu 驱动装好后也无法正常显示/调亮度/加速.
+    # 处理: 检测到即移除 (这是应急参数不是用户配置), 提示重启后生效.
+    if grep -qw "nomodeset" /proc/cmdline 2>/dev/null; then
+        warn "⚠ 检测到内核参数 nomodeset (安装器应急参数, 阻止 GPU 驱动接管显示)"
+        if command -v grubby >/dev/null 2>&1; then
+            grubby --update-kernel=ALL --remove-args="nomodeset vga=791" 2>/dev/null || true
+            info "  已移除 nomodeset/vga=791, 请重启后重新运行: sudo reboot && sudo bash $0"
+        else
+            warn "  未找到 grubby, 请手动移除 nomodeset"
+        fi
+        exit 0
+    fi
+
+    # ── NVIDIA: RPM Fusion akmod 唯一方案 (版本由仓库决定) ──
+    if [[ "$HAS_NVIDIA" -eq 1 ]]; then
+        if install_nvidia_driver; then
+            configure_nvidia
+        fi
+    fi
+
+    # ── AMD: Fedora 原生 amdgpu + Mesa ──
+    if [[ "$HAS_AMD" -eq 1 ]]; then
+        install_amd_gpu_stack
+    fi
+
+    # ── Intel: Fedora 原生 i915 + Mesa ──
+    if [[ "$HAS_INTEL" -eq 1 ]]; then
+        install_intel_gpu_stack
+    fi
+
+    # ── 通用媒体栈 (ffmpeg 替换 + gstreamer + OpenH264) ──
+    setup_multimedia
+
+    # ── 验证报告 (不静默) ──
+    verify_gpu
+
+    info "✅ CPU/GPU + 原生电源管理 + 解码 配置完成"
+    info "   NVIDIA: RPM Fusion akmod | CPU: power-profiles-daemon | 不使用 auto-cpufreq/TLP/.run"
+}
 # ============================================================================
 #  4/7  终端配置 (字体 + Zsh/Starship/Zinit + Konsole/Kitty)
 # ============================================================================
@@ -2880,7 +2570,7 @@ main() {
     fi
     [[ "$RUN_SOURCE" -eq 1 ]] && echo -e "  ${GREEN}✓${NC} 软件源优化"
     [[ "$DO_UPGRADE" -eq 1 ]] && echo -e "  ${GREEN}✓${NC} 系统升级检查 ${YELLOW}(全量升级+重启检测)${NC}"
-    [[ "$RUN_GPU" -eq 1 ]]    && echo -e "  ${GREEN}✓${NC} CPU/GPU驱动 + 电源方案(默认/auto-cpufreq) + 解码"
+    [[ "$RUN_GPU" -eq 1 ]]    && echo -e "  ${GREEN}✓${NC} CPU/GPU驱动 + 原生电源管理 + 解码"
     [[ "$RUN_TERM" -eq 1 ]]   && echo -e "  ${GREEN}✓${NC} 终端配置"
     [[ "$RUN_THEME" -eq 1 ]]  && echo -e "  ${GREEN}✓${NC} 主题 & 系统优化 (含 NM 优化)"
     [[ "$RUN_APPS" -eq 1 ]]   && echo -e "  ${GREEN}✓${NC} 应用管理"
@@ -2896,6 +2586,8 @@ main() {
     [[ "$RUN_SOURCE" -eq 1 ]] && optimize_sources
     [[ "$DO_UPGRADE" -eq 1 ]] && system_upgrade_check
     [[ "$RUN_GPU" -eq 1 ]]    && optimize_gpu
+    # 硬件服务初始化 (蓝牙/udev/linger) — 独立于 GPU 模块
+    [[ "$RUN_GPU" -eq 1 ]]    && init_hardware_services
     [[ "$RUN_TERM" -eq 1 ]]   && setup_terminal
     [[ "$RUN_THEME" -eq 1 ]]  && apply_theme
     [[ "$RUN_APPS" -eq 1 ]]   && manage_apps
@@ -2922,8 +2614,8 @@ main() {
     echo -e "${CYAN}──────────────────────────────────────────────────${NC}"
     echo ""
     echo -e "  重启后验证:"
-    echo -e "  • NVIDIA:       ${CYAN}nvidia-smi${NC}"
-    echo -e "  • auto-cpufreq: ${CYAN}auto-cpufreq --stats${NC}"
+    echo -e "  • NVIDIA:       ${CYAN}nvidia-smi${NC} / ${CYAN}modinfo -F version nvidia${NC}"
+    echo -e "  • 电源模式:     ${CYAN}powerprofilesctl get${NC} (KDE 电源设置切换)"
     echo -e "  • 输入法:       KDE 系统设置 → 虚拟键盘 → Fcitx5"
     [[ "$RUN_STEAM" -eq 1 ]] && echo -e "  • Steam:        ${CYAN}steam${NC}"
     echo -e "  • KVM:          ${CYAN}virt-manager${NC}"
