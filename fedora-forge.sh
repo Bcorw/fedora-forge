@@ -929,6 +929,77 @@ install_nvidia_run() {
 }
 
 # ============================================================================
+#  CPU 检测 (厂商/核心数/SMT) — 用于诊断报告 + 电源策略决策
+#  按 ChatGPT 建议: CPU 驱动由 Fedora 安装器负责 (amd-ucode/intel-microcode
+#  已含), 脚本只负责"识别厂商 → 用于电源/调度优化", 不重复安装固件.
+# ============================================================================
+detect_cpu() {
+    local cpuinfo="/proc/cpuinfo"
+    [[ -r "$cpuinfo" ]] || { CPU_VENDOR="未知"; CPU_CORES="?"; CPU_SMT="?"; return 0; }
+    # 厂商: AuthenticAMD / GenuineIntel (虚拟化/其他 CPU 归为"其他")
+    if grep -qi "AuthenticAMD" "$cpuinfo"; then
+        CPU_VENDOR="AMD"
+    elif grep -qi "GenuineIntel" "$cpuinfo"; then
+        CPU_VENDOR="Intel"
+    else
+        CPU_VENDOR="其他"
+    fi
+    # 核心数 (physical cores) 与 SMT (siblings/core 比值 >1 即超线程)
+    CPU_CORES=$(lscpu 2>/dev/null | awk -F: '/^CPU\(s\):/{gsub(/ /,"",$2); print $2}')
+    local cores_per_socket siblings_per_core
+    cores_per_socket=$(lscpu 2>/dev/null | awk -F: '/^Core\(s\) per socket:/{gsub(/ /,"",$2); print $2}')
+    siblings_per_core=$(lscpu 2>/dev/null | awk -F: '/^Thread\(s\) per core:/{gsub(/ /,"",$2); print $2}')
+    if [[ -n "$siblings_per_core" && "$siblings_per_core" -gt 1 ]]; then
+        CPU_SMT="开 (每核 $siblings_per_core 线程)"
+    else
+        CPU_SMT="关"
+    fi
+    # 电源策略提示 (ChatGPT: AMD 检测后启用 power-profiles-daemon 即可, 无需其他)
+    if [[ "$CPU_VENDOR" == "AMD" ]]; then
+        info "CPU 检测: AMD ($CPU_CORES 核, SMT $CPU_SMT) — Fedora 已含 amd-ucode 固件, 无需重复安装"
+    elif [[ "$CPU_VENDOR" == "Intel" ]]; then
+        info "CPU 检测: Intel ($CPU_CORES 核, SMT $CPU_SMT) — Fedora 已含 intel-microcode 固件, 无需重复安装"
+    fi
+}
+
+# ============================================================================
+#  音视频解码 (编解码模块 — ChatGPT 建议"真正应该自动做的部分")
+#  Fedora 官方 ffmpeg-free 缺 H.264/H.265; rpmfusion 完整版替换.
+#  GPU 专属 VA-API 解码器由各厂商分支负责, 这里只装通用解码栈.
+# ============================================================================
+setup_multimedia() {
+    # rpmfusion 的 ffmpeg 与 Fedora 官方 ffmpeg-free* 系列 (ffmpeg-free/libavcodec-free/
+    # libswscale-free 等) 文件冲突. 普通 install/swap 会因 free 系列残留而失败,
+    # 必须 --allowerasing 一次替换 (dnf 自动移除冲突的 free 包) (幂等: ffmpeg 已装则跳过)
+    info "安装音视频解码器..."
+    if rpm -q ffmpeg >/dev/null 2>&1; then
+        info "ffmpeg (rpmfusion 完整版) 已安装, 跳过"
+    elif rpm -q ffmpeg-free >/dev/null 2>&1; then
+        wait_rpm
+        if "$DNF" install --allowerasing -y --skip-unavailable ffmpeg >/dev/null 2>&1 \
+           && rpm -q ffmpeg >/dev/null 2>&1; then
+            info "✅ ffmpeg-free* 已替换为 rpmfusion 完整 ffmpeg (--allowerasing)"
+        else
+            warn "ffmpeg 替换失败 (可稍后手动: sudo dnf install --allowerasing ffmpeg)"
+        fi
+    else
+        dnf_install_quiet ffmpeg || warn "ffmpeg 安装失败"
+    fi
+    # 通用解码库 (不含 GPU 专属驱动, 避免 Intel/NVIDIA 无用包进入 AMD 机)
+    dnf_install_quiet ffmpeg-libs gstreamer1-plugins-base gstreamer1-plugins-good \
+        gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free \
+        gstreamer1-libav gstreamer1-vaapi libva libva-utils || true
+
+    # ── OpenH264 for Firefox (Cisco 开源 H.264 编解码, 视频会议/网页视频硬解) ──
+    # fedora-cisco-openh264 仓库提供, 幂等: 仓库已启用则跳过
+    if ! dnf repolist 2>/dev/null | grep -q "fedora-cisco-openh264"; then
+        info "启用 fedora-cisco-openh264 仓库 (Firefox OpenH264 视频编解码)..."
+        "$DNF" config-manager setopt fedora-cisco-openh264.enabled=1 >/dev/null 2>&1 || true
+    fi
+    dnf_install_quiet openh264 gstreamer1-plugin-openh264 mozilla-openh264 || true
+}
+
+# ============================================================================
 #  3/7  CPU/GPU驱动 + 电源方案(默认/auto-cpufreq) + 音视频解码
 # ============================================================================
 optimize_gpu() {
@@ -952,6 +1023,9 @@ optimize_gpu() {
     echo "$GPU_INFO" | grep -qiE "\[1002:|\[1022:"  && HAS_AMD=1
     echo "$GPU_INFO" | grep -qi "\[8086:"           && HAS_INTEL=1
     info "检测: NVIDIA=$HAS_NVIDIA  AMD=$HAS_AMD  Intel=$HAS_INTEL"
+
+    # CPU 检测 (厂商/核心数/SMT → 诊断报告 + 电源策略上下文)
+    detect_cpu
 
     # ── nomodeset 清理 (安装器应急参数) ──
     # Fedora 安装器在独显直连/驱动未装时显示异常会自动加 nomodeset vga=791,
@@ -1157,36 +1231,8 @@ EOF
     fi
     fi
 
-    # ── 音视频解码 ──
-    # rpmfusion 的 ffmpeg 与 Fedora 官方 ffmpeg-free* 系列 (ffmpeg-free/libavcodec-free/
-    # libswscale-free 等) 文件冲突. 普通 install/swap 会因 free 系列残留而失败,
-    # 必须 --allowerasing 一次替换 (dnf 自动移除冲突的 free 包) (幂等: ffmpeg 已装则跳过)
-    info "安装音视频解码器..."
-    if rpm -q ffmpeg >/dev/null 2>&1; then
-        info "ffmpeg (rpmfusion 完整版) 已安装, 跳过"
-    elif rpm -q ffmpeg-free >/dev/null 2>&1; then
-        wait_rpm
-        if "$DNF" install --allowerasing -y --skip-unavailable ffmpeg >/dev/null 2>&1 \
-           && rpm -q ffmpeg >/dev/null 2>&1; then
-            info "✅ ffmpeg-free* 已替换为 rpmfusion 完整 ffmpeg (--allowerasing)"
-        else
-            warn "ffmpeg 替换失败 (可稍后手动: sudo dnf install --allowerasing ffmpeg)"
-        fi
-    else
-        dnf_install_quiet ffmpeg || warn "ffmpeg 安装失败"
-    fi
-    # 通用解码库 (不含 GPU 专属驱动, 避免 Intel/NVIDIA 无用包进入 AMD 机)
-    dnf_install_quiet ffmpeg-libs gstreamer1-plugins-base gstreamer1-plugins-good \
-        gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free \
-        gstreamer1-libav gstreamer1-vaapi libva libva-utils || true
-
-    # ── OpenH264 for Firefox (Cisco 开源 H.264 编解码, 视频会议/网页视频硬解) ──
-    # fedora-cisco-openh264 仓库提供, 幂等: 仓库已启用则跳过
-    if ! dnf repolist 2>/dev/null | grep -q "fedora-cisco-openh264"; then
-        info "启用 fedora-cisco-openh264 仓库 (Firefox OpenH264 视频编解码)..."
-        "$DNF" config-manager setopt fedora-cisco-openh264.enabled=1 >/dev/null 2>&1 || true
-    fi
-    dnf_install_quiet openh264 gstreamer1-plugin-openh264 mozilla-openh264 || true
+    # ── 音视频解码 (独立函数 setup_multimedia: ffmpeg 替换 + gstreamer + OpenH264) ──
+    setup_multimedia
 
     # ── NVIDIA: 官方生产分支 (595.x) + open 内核模块 ──
     #  610.x = 新特性分支(测试版): 有显示管线回归 (color_pipeline 色斑/内屏黑屏/atomic commit 失败)
@@ -1402,6 +1448,18 @@ EOF
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger 2>/dev/null || true
 
+    # 用户服务持久化 (ChatGPT 建议: Flatpak portal/用户服务需 linger)
+    #  失败不显示 ERROR — 用户会话未初始化时正常 (首次登录后自动激活)
+    if command -v loginctl >/dev/null 2>&1; then
+        if loginctl show-user "$ACTUAL_USER" 2>/dev/null | grep -q 'Linger=yes'; then
+            info "✅ loginctl linger 已启用 ($ACTUAL_USER)"
+        else
+            loginctl enable-linger "$ACTUAL_USER" 2>/dev/null \
+                && info "✅ loginctl linger 已启用 ($ACTUAL_USER, 用户服务开机自启)" \
+                || info "loginctl linger 跳过 (用户会话未初始化, 首次登录后自动生效)"
+        fi
+    fi
+
     # 清理本机用不到的 GPU 专属包 (按检测到的硬件精确清理, 避免误删)
     if [[ "$HAS_NVIDIA" -eq 0 ]]; then
         for pkg in nvidia-gpu-firmware xorg-x11-drv-nvidia-libs; do
@@ -1429,6 +1487,7 @@ EOF
     echo -e "  ${CYAN}GPU 检测报告:${NC}"
     echo "  ──────────────────────────────────"
     echo "  CPU: $(lscpu 2>/dev/null | grep -m1 'Model name' | sed 's/Model name:[[:space:]]*//')"
+    echo "       厂商: ${CPU_VENDOR:-未知} | 核心: ${CPU_CORES:-?} | SMT: ${CPU_SMT:-?}"
     echo "  ──────────────────────────────────"
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
@@ -1469,6 +1528,7 @@ EOF
     command -v vulkaninfo >/dev/null 2>&1 && echo "  Vulkan: ✓" || echo "  Vulkan: ✗ 缺失"
     command -v vainfo >/dev/null 2>&1 && echo "  VA-API: ✓" || echo "  VA-API: ✗ 缺失"
     rpm -q ffmpeg >/dev/null 2>&1 && echo "  FFmpeg: ✓ (rpmfusion 完整版)" || echo "  FFmpeg: ✗ 缺失"
+    rpm -q gstreamer1-libav >/dev/null 2>&1 && echo "  GStreamer: ✓ (含 libav 解码)" || echo "  GStreamer: ✗ 缺 libav"
     echo "  ──────────────────────────────────"
     # 混合模式提示 (Chromium/Electron 在混合模式 Wayland 下强制走核显, 属正常)
     if [[ "$DISPLAY_MODE" == *"混合模式"* ]] && command -v google-chrome >/dev/null 2>&1; then
@@ -2035,6 +2095,19 @@ cleanup_stock_wallpapers() {
 apply_theme() {
     step "5/7 主题 & 系统优化"
 
+    # ── 0) KDE 桌面组件完整性 (ChatGPT 建议: 网络/声音/蓝牙 widget 依赖)
+    #   Fedora KDE spin 预装, 但 Minimal/非 KDE spin 或精简安装会缺; 幂等: 缺才装
+    local KDE_PKGS_MISSING=()
+    for p in plasma-workspace plasma-desktop plasma-nm plasma-pa bluedevil; do
+        rpm -q "$p" >/dev/null 2>&1 || KDE_PKGS_MISSING+=("$p")
+    done
+    if [[ ${#KDE_PKGS_MISSING[@]} -gt 0 ]]; then
+        info "补齐 KDE 桌面组件 (${KDE_PKGS_MISSING[*]})..."
+        dnf_install_quiet "${KDE_PKGS_MISSING[@]}" || warn "KDE 组件安装失败 (可稍后: sudo dnf install ${KDE_PKGS_MISSING[*]})"
+    else
+        info "✅ KDE 桌面组件完整 (plasma-workspace/desktop/nm/pa/bluedevil)"
+    fi
+
     # ── 0) 清理系统自带壁纸 (仅保留用户自定义壁纸) ──
     cleanup_stock_wallpapers
 
@@ -2309,6 +2382,57 @@ EOD
 }
 
 # ============================================================================
+#  安装后自检报告 (ChatGPT 建议: 安装失败用户要知道, 不静默)
+#  输出: 终端栈 / 硬件服务 / KDE / 图形栈 状态 + systemctl --failed
+# ============================================================================
+system_selfcheck() {
+    echo ""
+    echo -e "  ${CYAN}═ 系统自检报告 ═${NC}"
+    echo "  ──────────────────────────────────"
+    # 终端栈
+    echo "  [终端]"
+    local t_items="zsh:zsh starship:starship fastfetch:fastfetch yazi:yazi fzf-tab:${ACTUAL_HOME}/.config/zsh/plugins/fzf-tab"
+    local item bin
+    for item in $t_items; do
+        bin="${item#*:}"
+        if command -v "${bin##*/}" >/dev/null 2>&1 || [[ -e "$bin" ]] || [[ -d "$bin" ]]; then
+            echo "    ✓ ${item%%:*}"
+        else
+            echo "    ✗ ${item%%:*} (缺失)"
+        fi
+    done
+    # 硬件服务
+    echo "  [硬件服务]"
+    local h_items="bluetooth:bluetooth.service power-profiles-daemon:power-profiles-daemon.service tuned:tuned.service"
+    for item in $h_items; do
+        if systemctl is-active "${item#*:}" >/dev/null 2>&1; then
+            echo "    ✓ ${item%%:*}"
+        elif systemctl is-enabled "${item#*:}" >/dev/null 2>&1; then
+            echo "    ~ ${item%%:*} (已启用未运行)"
+        else
+            echo "    ✗ ${item%%:*} (未安装/未启用)"
+        fi
+    done
+    # 图形栈
+    echo "  [图形栈]"
+    rpm -q mesa-vulkan-drivers >/dev/null 2>&1 || rpm -q mesa-dri-drivers >/dev/null 2>&1 \
+        && echo "    ✓ mesa" || echo "    ✗ mesa 缺失"
+    command -v vulkaninfo >/dev/null 2>&1 && echo "    ✓ vulkan" || echo "    ✗ vulkan 缺失"
+    modinfo -F version nvidia >/dev/null 2>&1 && echo "    ✓ nvidia ($(modinfo -F version nvidia 2>/dev/null))" \
+        || echo "    - nvidia 未装 (核显/nouveau 模式)"
+    # 失败服务
+    echo "  ──────────────────────────────────"
+    local failed
+    failed=$(systemctl --failed --no-legend 2>/dev/null | awk '{print $1}' | grep -v '^$' || true)
+    if [[ -z "$failed" ]]; then
+        echo "  Failed services: none ✅"
+    else
+        echo "  ⚠ Failed services:"
+        echo "$failed" | sed 's/^/    - /'
+    fi
+    echo "  ──────────────────────────────────"
+}
+
 #  壁纸归档: 全模块跑完后, 把项目 wallpapers/ 整个移动到用户图片目录
 # ============================================================================
 # 时机: main() 所有模块之后调用 — 5/7 主题模块还要用 wallpapers/ 里的图设登录背景,
@@ -2361,7 +2485,7 @@ manage_apps() {
         pim-sieve-editor grantlee-editor kaddressbook kontact korganizer kmail
         libreoffice-core okular khelpcenter plasma-welcome kinfocenter filelight
         kmouth kfind akonadi-import-wizard kleopatra kwrite pim-data-exporter
-        akregator firefox kde-connect krdc krfb neochat skanpage im-chooser
+        akregator kde-connect krdc krfb neochat skanpage im-chooser
         mediawriter kjournald kde-partitionmanager dragon elisa-player kamoso
         qrca kmines kpat kmahjongg ibus
     )
@@ -2527,18 +2651,10 @@ REPO
         "$DNF" install -y code 2>/dev/null || true
     fi
 
-    # ── Chrome ──
-    if ! rpm -q google-chrome-stable >/dev/null 2>&1; then
-        info "安装 Google Chrome..."
-        "$DNF" install -y fedora-workstation-repositories 2>/dev/null || true
-        "$DNF" config-manager setopt google-chrome.enabled=1 2>/dev/null || true
-        "$DNF" install -y google-chrome-stable 2>/dev/null || true
-    fi
-
     # ── Telegram / Haruna (dnf) ──
     dnf_ensure telegram-desktop haruna kate
 
-    # ── QQ / 微信 / ONLYOFFICE / Gopeed / ReadAny / VutronMusic / zed / MarkShot / ScrcpyGUI (RPM) ──
+    # ── QQ / 微信 / ONLYOFFICE / Gopeed / ReadAny / VutronMusic / zed / MarkShot / ScrcpyGUI (RPM) / hermes-desktop ──
     install_direct_rpm "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/release/c97651b2/QQ_3.2.32_260730_x86_64_01.rpm" "QQ" "linuxqq"
     install_direct_rpm "https://dldir1v6.qq.com/weixin/Universal/Linux/WeChatLinux_x86_64.rpm" "微信" "wechat"
     # GitHub 应用: 动态解析最新 release, 不写死版本号 (已装则跳过)
@@ -2549,6 +2665,7 @@ REPO
     install_github_rpm "x6nux/zed-globalization" "zed-globalization" "zedg" "linux-x86_64.*\.rpm$"
     install_github_rpm "jswysnemc/mark-shot" "Mark Shot" "mark-shot" "fedora_x86_64.*\.rpm$"
     install_github_rpm "kil0bit-kb/scrcpy-gui" "ScrcpyGUI" "Scrcpy GUI" "x86_64.*\.rpm$"
+    install_github_rpm "fathah/hermes-desktop" "hermes-desktop" "hermes desktop" "hermes-desktop-[0-9].*\.rpm$"
 
     # ── KVM/QEMU ──
     info "安装 KVM/QEMU..."
@@ -2786,6 +2903,9 @@ main() {
 
     # 壁纸归档: 所有模块完成后 (5/7 登录背景图已用过 wallpapers/) → 移动到图片目录
     move_wallpapers
+
+    # 安装后自检报告 (systemctl --failed + 终端/硬件/KDE/图形栈 状态)
+    system_selfcheck
 
     # ═══════════ 清理═══════════
     info "清理临时文件..."
